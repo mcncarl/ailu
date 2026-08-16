@@ -291,7 +291,7 @@ describe('ChatContextService native-session handoff', () => {
     expect(prepared.effectivePrompt).toContain('当前模型配置已改变');
   });
 
-  it('durably checkpoints the older prefix before a long fresh handoff', async () => {
+  it('builds a complete long handoff without a durable checkpoint while budget is roomy', async () => {
     const conversation = conversationFrom(Array.from({ length: 10 }, (_, index) => ({
       user: index === 0 ? '决定长期保留这个结论。' : `用户消息 ${index + 1}`,
       assistant: `助手回答 ${index + 1}`,
@@ -304,11 +304,11 @@ describe('ChatContextService native-session handoff', () => {
       currentPrompt: '请接手。',
     });
 
-    expect(prepared.mode).toBe('checkpoint-handoff');
+    expect(prepared.mode).toBe('fresh-handoff');
     expect(store.commitCalls).toHaveLength(0);
-    expect(prepared.contextCheckpointDraft?.throughMessageSequence).toBe(8);
-    expect(prepared.contextCheckpointDraft?.summary.decisions)
-      .toContain('决定长期保留这个结论。');
+    expect(prepared.contextCheckpointDraft).toBeUndefined();
+    expect(prepared.notice).toBe('');
+    expect(prepared.effectivePrompt).toContain('决定长期保留这个结论。');
   });
 
   it('keeps a normal resume bounded and leaves the checkpoint store untouched', async () => {
@@ -334,6 +334,53 @@ describe('ChatContextService native-session handoff', () => {
     expect(store.windowCalls).toBe(1);
     expect(store.fullCalls).toBe(0);
     expect(store.commitCalls).toHaveLength(0);
+  });
+
+  it('keeps a long 1M native session continuous without fixed-turn compaction', async () => {
+    const conversation = withFreshSession(conversationFrom(Array.from(
+      { length: 80 },
+      (_, index) => ({ user: `短问题 ${index + 1}`, assistant: `短回答 ${index + 1}` }),
+    )), 'claude');
+    const store = new FakeContextStore(conversation);
+
+    const prepared = await service(store).prepare({
+      conversationId: conversation.id,
+      targetAgentId: 'claude',
+      currentPrompt: '继续第 81 轮。',
+      resumeCandidate: 'claude-session',
+      modelContextTokens: 1_000_000,
+      modelOutputReserveTokens: 128_000,
+      reservedInputTokens: 8_000,
+    });
+
+    expect(prepared.mode).toBe('native-resume');
+    expect(prepared.contextCheckpointDraft).toBeUndefined();
+    expect(prepared.notice).toBe('');
+    expect(store.fullCalls).toBe(1);
+  });
+
+  it('starts a fresh model session without checkpointing a roomy transcript', async () => {
+    const conversation = withFreshSession(conversationFrom(Array.from(
+      { length: 30 },
+      (_, index) => ({ user: `问题 ${index + 1}`, assistant: `回答 ${index + 1}` }),
+    )), 'claude');
+    const store = new FakeContextStore(conversation);
+
+    const prepared = await service(store).prepare({
+      conversationId: conversation.id,
+      targetAgentId: 'claude',
+      currentPrompt: '使用刚切换的模型继续。',
+      // Missing resumeCandidate means the model/config fingerprint changed.
+      modelContextTokens: 1_000_000,
+      modelOutputReserveTokens: 20_000,
+    });
+
+    expect(prepared.mode).toBe('fresh-handoff');
+    expect(prepared.contextCheckpointDraft).toBeUndefined();
+    expect(prepared.sessionId).toBeUndefined();
+    expect(prepared.notice).toBe('');
+    expect(prepared.effectivePrompt).toContain('问题 1');
+    expect(prepared.effectivePrompt).toContain('回答 30');
   });
 
   it('prepares a provider-neutral fallback for a valid Codex resume without changing its ordinary prompt', async () => {
@@ -389,6 +436,64 @@ describe('ChatContextService native-session handoff', () => {
 });
 
 describe('ChatContextService checkpoints', () => {
+  it('creates post-compaction headroom so the next completed turn does not compact again', async () => {
+    const specs = Array.from({ length: 12 }, (_, index) => ({
+      user: `${index + 1}:${'中'.repeat(300)}`,
+      assistant: `${index + 1}:${'答'.repeat(300)}`,
+    }));
+    const conversation = withFreshSession(conversationFrom(specs), 'claude');
+    const store = new FakeContextStore(conversation);
+    const contextService = service(store, { summaryTokenLimit: 1_000 });
+
+    const compacted = await contextService.prepare({
+      conversationId: conversation.id,
+      targetAgentId: 'claude',
+      currentPrompt: '继续。',
+      resumeCandidate: 'claude-session',
+      modelContextTokens: 32_000,
+      modelOutputReserveTokens: 20_000,
+      reservedInputTokens: 4_000,
+    });
+    expect(compacted.mode).toBe('checkpoint-handoff');
+    expect(compacted.contextCheckpointDraft).toBeDefined();
+    expect(compacted.notice).toBe('上下文接近上限，已整理较早对话；完整记录仍保留。');
+
+    const nextConversation = conversationFrom([
+      ...specs,
+      { user: '继续。', assistant: '这一轮已经完成。' },
+    ], {
+      revision: conversation.revision + 3,
+      contextCheckpoint: {
+        ...compacted.contextCheckpointDraft!,
+        prefixSha256: 'c'.repeat(64),
+      },
+      sessionIds: { claude: 'claude-after-checkpoint' },
+      sessionOwnerships: {
+        claude: {
+          sessionId: 'claude-after-checkpoint',
+          conversationId: conversation.id,
+          agentId: 'claude',
+          claimedAt: 2_000,
+          runId: 'turn-13',
+        },
+      },
+    });
+    store.conversation = nextConversation;
+
+    const followup = await contextService.prepare({
+      conversationId: conversation.id,
+      targetAgentId: 'claude',
+      currentPrompt: '再继续一轮。',
+      resumeCandidate: 'claude-after-checkpoint',
+      modelContextTokens: 32_000,
+      modelOutputReserveTokens: 20_000,
+      reservedInputTokens: 4_000,
+    });
+    expect(followup.mode).toBe('native-resume');
+    expect(followup.contextCheckpointDraft).toBeUndefined();
+    expect(followup.notice).toBe('');
+  });
+
   it('extends an existing checkpoint atomically and does not duplicate its summary', async () => {
     let conversation = conversationFrom(Array.from({ length: 10 }, (_, index) => ({
       agentId: 'claude' as const,
@@ -406,7 +511,10 @@ describe('ChatContextService checkpoints', () => {
     };
     const store = new FakeContextStore(conversation);
 
-    const prepared = await service(store, { checkpointTurnLimit: 8 }).prepare({
+    const prepared = await service(store, {
+      checkpointTurnLimit: 8,
+      rawTailTurns: 6,
+    }).prepare({
       conversationId: conversation.id,
       targetAgentId: 'codex',
       currentPrompt: '请继续。',
@@ -416,11 +524,13 @@ describe('ChatContextService checkpoints', () => {
     expect(store.commitCalls).toHaveLength(0);
     const draft = prepared.contextCheckpointDraft;
     expect(draft?.previousCheckpointId).toBe('checkpoint-old');
-    expect(draft?.throughMessageSequence).toBe(8);
-    expect(draft?.throughMessageId).toBe('turn-4-assistant');
+    expect(draft?.throughMessageSequence).toBeGreaterThan(4);
+    expect(draft?.throughMessageId).toBe(
+      conversation.messages[(draft?.throughMessageSequence ?? 1) - 1]?.id,
+    );
     expect(draft?.summary.decisions.filter(value => value === '保留完整聊天记录')).toHaveLength(1);
     expect(draft?.summary.decisions).toContain('决定继续使用现有架构。');
-    expect(readHandoff(prepared.effectivePrompt).recentCompletedTurns).toHaveLength(6);
+    expect(readHandoff(prepared.effectivePrompt).recentCompletedTurns.length).toBeLessThanOrEqual(6);
   });
 
   it('uses an existing checkpoint directly when it already covers all completed turns', async () => {
@@ -449,7 +559,7 @@ describe('ChatContextService checkpoints', () => {
     expect(readHandoff(prepared.effectivePrompt).checkpoint.decisions).toContain('决定保留完整记录。');
   });
 
-  it('loads a legacy history larger than the bounded window only when a checkpoint is required', async () => {
+  it('loads complete legacy history to prove the budget without forcing a turn-count checkpoint', async () => {
     const specs = Array.from({ length: 60 }, (_, index) => ({
       user: `旧消息 ${index + 1}`,
       assistant: `旧回答 ${index + 1}`,
@@ -464,11 +574,11 @@ describe('ChatContextService checkpoints', () => {
       resumeCandidate: 'claude-session',
     });
 
-    expect(prepared.mode).toBe('checkpoint-handoff');
+    expect(prepared.mode).toBe('native-resume');
     expect(store.windowCalls).toBe(1);
     expect(store.fullCalls).toBe(1);
     expect(store.commitCalls).toHaveLength(0);
-    expect(prepared.contextCheckpointDraft).toBeDefined();
+    expect(prepared.contextCheckpointDraft).toBeUndefined();
     expect(store.conversation.messages).toHaveLength(120);
   });
 
@@ -487,7 +597,10 @@ describe('ChatContextService checkpoints', () => {
     };
     const store = new FakeContextStore(conversation);
 
-    const prepared = await service(store).prepare({
+    const prepared = await service(store, {
+      checkpointTurnLimit: 50,
+      rawTailTurns: 6,
+    }).prepare({
       conversationId: conversation.id,
       targetAgentId: 'claude',
       currentPrompt: '继续。',
@@ -513,11 +626,15 @@ describe('ChatContextService checkpoints', () => {
     })));
     const store = new FakeContextStore(conversation);
 
-    const prepared = await service(store, { checkpointTurnLimit: 1_000 }).prepare({
+    const prepared = await service(store, {
+      summaryTokenLimit: 2_000,
+    }).prepare({
       conversationId: conversation.id,
       targetAgentId: 'codex',
       currentPrompt: '继续。',
-      modelContextTokens: 8_000,
+      modelContextTokens: 12_000,
+      modelOutputReserveTokens: 1_000,
+      hardOutputReserveTokens: 500,
     });
 
     expect(prepared.mode).toBe('checkpoint-handoff');
@@ -536,6 +653,45 @@ describe('ChatContextService checkpoints', () => {
       targetAgentId: 'codex',
       currentPrompt: '中'.repeat(5_000),
       modelContextTokens: 1_000,
+      modelOutputReserveTokens: 200,
+      hardOutputReserveTokens: 50,
+    })).rejects.toBeInstanceOf(ChatContextOverflowError);
+    expect(store.commitCalls).toHaveLength(0);
+  });
+
+  it('does not write a no-progress checkpoint when the current request alone exceeds the byte envelope', async () => {
+    const conversation = conversationFrom([
+      { user: '旧问题一', assistant: '旧回答一' },
+      { user: '旧问题二', assistant: '旧回答二' },
+    ]);
+    const store = new FakeContextStore(conversation);
+
+    await expect(service(store).prepare({
+      conversationId: conversation.id,
+      targetAgentId: 'codex',
+      currentPrompt: 'a'.repeat(800_000),
+      modelContextTokens: 1_000_000,
+      modelOutputReserveTokens: 20_000,
+      maxRequestBytes: 1024 * 1024,
+    })).rejects.toBeInstanceOf(ChatContextOverflowError);
+    expect(store.commitCalls).toHaveLength(0);
+    expect(store.conversation.contextCheckpoint).toBeUndefined();
+  });
+
+  it('fails closed when an oversized request has no projectable history to compress', async () => {
+    const conversation = withFreshSession(conversationFrom([
+      { user: '   ', assistant: '   ' },
+    ]), 'claude');
+    const store = new FakeContextStore(conversation);
+
+    await expect(service(store).prepare({
+      conversationId: conversation.id,
+      targetAgentId: 'claude',
+      currentPrompt: '中'.repeat(1_200),
+      resumeCandidate: 'claude-session',
+      modelContextTokens: 1_000,
+      modelOutputReserveTokens: 200,
+      hardOutputReserveTokens: 50,
     })).rejects.toBeInstanceOf(ChatContextOverflowError);
     expect(store.commitCalls).toHaveLength(0);
   });

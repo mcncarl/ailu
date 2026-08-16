@@ -87,7 +87,13 @@ class FakeAppServerClient extends EventEmitter {
         nextCursor: 'page-2',
       };
     }
-    if (method === 'config/read') return { config: { model: 'model-a' } };
+    if (method === 'config/read') return {
+      config: {
+        model: 'model-a',
+        model_context_window: 353_400,
+        model_auto_compact_token_limit: 334_800,
+      },
+    };
     if (method === 'account/read') return { account: { type: 'chatgpt' }, authMode: 'chatgpt' };
     if (method === 'modelProvider/capabilities/read') return { imageGeneration: this.imageGeneration, webSearch: false };
     if (method === 'thread/start') {
@@ -256,6 +262,8 @@ describe('CodexAppServerRuntime', () => {
 
     expect(status.state).toBe('ready');
     expect(status.currentModelId).toBe('model-a');
+    expect(status.contextWindowTokens).toBe(353_400);
+    expect(status.autoCompactTokenLimit).toBe(334_800);
     expect(status.currentModel?.displayName).toBe('Model A');
     expect(status.models.map(model => model.id)).toEqual(['model-a', 'model-b']);
     expect(status.currentModel?.supportedReasoningEfforts).toEqual([
@@ -1669,6 +1677,36 @@ describe('CodexAppServerRuntime', () => {
     });
     expect(turnStart?.params).toMatchObject({ model: 'model-b', effort: 'low' });
     expect(turnStart?.params).not.toHaveProperty('collaborationMode');
+    await runtime.shutdown();
+  });
+
+  test('switches the selected model on a resumed App Server thread', async () => {
+    const client = new FakeAppServerClient();
+    const runtime = new CodexAppServerRuntime(client as unknown as CodexAppServerClient);
+
+    await runtime.runTurn({
+      ...request('MODEL_A_TURN'),
+      model: 'model-a',
+    }, connection, () => {});
+    await runtime.runTurn({
+      ...request('MODEL_B_ON_EXISTING_THREAD'),
+      sessionId: 'thread-1',
+      model: 'model-b',
+      reasoningEffort: 'low',
+    }, connection, () => {});
+
+    const resumedThread = client.requests.find(entry => entry.method === 'thread/resume');
+    expect(resumedThread?.params).toMatchObject({ threadId: 'thread-1' });
+    const switchedTurn = client.requests.find(entry => {
+      if (entry.method !== 'turn/start') return false;
+      const params = entry.params as { input?: Array<{ text?: string }> };
+      return params.input?.some(item => item.text === 'MODEL_B_ON_EXISTING_THREAD');
+    });
+    expect(switchedTurn?.params).toMatchObject({
+      threadId: 'thread-1',
+      model: 'model-b',
+      effort: 'low',
+    });
     await runtime.shutdown();
   });
 

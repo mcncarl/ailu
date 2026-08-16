@@ -9,17 +9,20 @@ import { createId } from '../utils/id';
 import {
   buildConversationHandoffPrompt,
   buildDeterministicFallbackSummary,
-  DEFAULT_HARD_CONTEXT_RATIO,
-  DEFAULT_RAW_TAIL_TURNS,
-  DEFAULT_SOFT_CONTEXT_RATIO,
-  DEFAULT_TURN_CHECKPOINT_LIMIT,
+  DEFAULT_HARD_OUTPUT_RESERVE_TOKENS,
+  DEFAULT_MAX_REQUEST_BYTES,
+  DEFAULT_MODEL_OUTPUT_RESERVE_TOKENS,
+  DEFAULT_RAW_TAIL_TOKENS,
   DEFAULT_UNKNOWN_CONTEXT_TOKENS,
   estimateContextBudget,
+  estimateContextTokens,
   evaluateTargetSessionFreshness,
   projectCompletedConversation,
   sanitizeConversationContextSummary,
   selectRawTail,
+  selectRawTailByTokenBudget,
   type CompletedConversationProjection,
+  type ContextBudgetEstimate,
   type ContextTailSelection,
   type ProjectedContextTurn,
 } from './contextCompression';
@@ -54,6 +57,14 @@ export interface PrepareChatContextInput {
   /** A session already validated against the active runtime configuration. */
   resumeCandidate?: string;
   modelContextTokens?: number;
+  modelOutputReserveTokens?: number;
+  hardOutputReserveTokens?: number;
+  /** System prompt and other caller-visible request components not in currentPrompt. */
+  requestOverheadText?: readonly string[];
+  /** Fixed hidden runtime/tool and binary-attachment allowance. */
+  reservedInputTokens?: number;
+  reservedRequestBytes?: number;
+  maxRequestBytes?: number;
 }
 
 export interface ChatContextStore {
@@ -66,15 +77,17 @@ export interface ChatContextServiceOptions {
   now?: () => number;
   createCheckpointId?: () => string;
   windowMessages?: number;
+  /** Optional legacy cap; the default recent tail is token-bounded, not turn-bounded. */
   rawTailTurns?: number;
+  rawTailTokens?: number;
+  /** Disabled by default. Production checkpoints are budget-driven. */
   checkpointTurnLimit?: number;
-  softContextRatio?: number;
-  hardContextRatio?: number;
   safetyFactor?: number;
+  summaryTokenLimit?: number;
 }
 
 export class ChatContextOverflowError extends Error {
-  constructor(message = '当前消息和最近上下文过长，无法在安全范围内完成交接。') {
+  constructor(message = '当前消息和上下文过长，无法在所选模型的安全范围内发送。请减少附件或输入长度后重试。') {
     super(message);
     this.name = 'ChatContextOverflowError';
   }
@@ -90,29 +103,31 @@ export class ChatContextService {
   private readonly now: () => number;
   private readonly createCheckpointId: () => string;
   private readonly windowMessages: number;
-  private readonly rawTailTurns: number;
-  private readonly checkpointTurnLimit: number;
-  private readonly softContextRatio: number;
-  private readonly hardContextRatio: number;
+  private readonly rawTailTurnCap: number | null;
+  private readonly rawTailTokens: number;
+  private readonly checkpointTurnLimit: number | null;
   private readonly safetyFactor: number;
+  private readonly summaryTokenLimit: number;
 
   constructor(private readonly options: ChatContextServiceOptions) {
     this.now = options.now ?? Date.now;
     this.createCheckpointId = options.createCheckpointId ?? (() => createId('ctx'));
     this.windowMessages = positiveInteger(options.windowMessages, DEFAULT_WINDOW_MESSAGES);
-    this.rawTailTurns = nonNegativeInteger(options.rawTailTurns, DEFAULT_RAW_TAIL_TURNS);
-    this.checkpointTurnLimit = positiveInteger(
-      options.checkpointTurnLimit,
-      DEFAULT_TURN_CHECKPOINT_LIMIT,
-    );
-    this.softContextRatio = boundedRatio(options.softContextRatio, DEFAULT_SOFT_CONTEXT_RATIO);
-    this.hardContextRatio = boundedRatio(options.hardContextRatio, DEFAULT_HARD_CONTEXT_RATIO);
+    this.rawTailTurnCap = options.rawTailTurns === undefined
+      ? null
+      : nonNegativeInteger(options.rawTailTurns, 0);
+    this.rawTailTokens = positiveInteger(options.rawTailTokens, DEFAULT_RAW_TAIL_TOKENS);
+    this.checkpointTurnLimit = options.checkpointTurnLimit === undefined
+      ? null
+      : positiveInteger(options.checkpointTurnLimit, Number.MAX_SAFE_INTEGER);
     this.safetyFactor = positiveNumber(options.safetyFactor, DEFAULT_SAFETY_FACTOR);
+    this.summaryTokenLimit = positiveInteger(options.summaryTokenLimit, 4_096);
   }
 
   async prepare(input: PrepareChatContextInput): Promise<ChatContextPreparation> {
     const conversationId = requireText(input.conversationId, 'conversationId');
     const currentPrompt = requireText(input.currentPrompt, 'currentPrompt');
+    const budgetPolicy = resolveBudgetPolicy(input);
     const window = await this.options.store.loadConversationWindow(
       conversationId,
       this.windowMessages,
@@ -121,7 +136,7 @@ export class ChatContextService {
 
     const completedTurns = window.conversation.turns.filter(turn => turn.state === 'completed');
     if (completedTurns.length === 0) {
-      this.assertCurrentPromptFits(currentPrompt, input.modelContextTokens);
+      this.assertCurrentPromptFits(currentPrompt, budgetPolicy);
       return {
         effectivePrompt: currentPrompt,
         sourceRevision: window.conversation.revision,
@@ -150,11 +165,14 @@ export class ChatContextService {
     const agentSwitch = latestCompletedTurn?.agentId !== input.targetAgentId;
     const needsFreshHandoff = !canResume || agentSwitch;
     const postCheckpointTurnCount = countCompletedTurnsAfterCheckpoint(window.conversation);
-    const turnLimitReached = postCheckpointTurnCount >= this.checkpointTurnLimit;
+    const turnLimitReached = this.checkpointTurnLimit !== null
+      && postCheckpointTurnCount >= this.checkpointTurnLimit;
 
     let source = deriveWindowSource(window);
     const codexFallbackNeeded = canResume && input.targetAgentId === 'codex';
-    if (!source.safe && (needsFreshHandoff || turnLimitReached || codexFallbackNeeded)) {
+    // A bounded window cannot prove the complete request budget when an older
+    // uncheckpointed prefix exists. Load canonical history instead of guessing.
+    if (!source.safe) {
       const full = await this.options.store.getConversation(conversationId);
       if (!full) throw new Error(`Conversation ${conversationId} was not found.`);
       source = deriveFullSource(full);
@@ -163,30 +181,27 @@ export class ChatContextService {
     const sourceBudget = estimateContextBudget({
       projection: source.projection,
       previousSummary: checkpointSummary(source.conversation),
-      additionalText: [currentPrompt],
-      modelContextTokens: input.modelContextTokens ?? DEFAULT_UNKNOWN_CONTEXT_TOKENS,
-      softRatio: this.softContextRatio,
-      hardRatio: this.hardContextRatio,
-      safetyFactor: this.safetyFactor,
+      additionalText: [...budgetPolicy.requestOverheadText, currentPrompt],
+      ...budgetEstimateOptions(budgetPolicy, this.safetyFactor),
     });
-    const budgetCheckpointNeeded = source.safe && sourceBudget.overSoftLimit;
-    const handoffWouldDropPrefix = needsFreshHandoff && source.projection.turns.length > this.rawTailTurns;
-    let checkpointNeeded = turnLimitReached || budgetCheckpointNeeded || handoffWouldDropPrefix;
+    const budgetCheckpointNeeded = sourceBudget.overSoftLimit;
+    let checkpointNeeded = turnLimitReached || budgetCheckpointNeeded;
 
-    if (!source.safe && checkpointNeeded) {
-      const full = await this.options.store.getConversation(conversationId);
-      if (!full) throw new Error(`Conversation ${conversationId} was not found.`);
-      source = deriveFullSource(full);
+    if (checkpointNeeded && source.projection.turns.length === 0) {
+      // A turn-count test hook may be irrelevant when nothing is projectable,
+      // but a real budget overflow with no compressible prefix must fail here.
+      if (budgetCheckpointNeeded) throw new ChatContextOverflowError();
+      checkpointNeeded = false;
     }
-
-    if (checkpointNeeded && source.projection.turns.length === 0) checkpointNeeded = false;
 
     if (checkpointNeeded) {
       const compression = this.chooseSafeCompression(
         source.projection,
         checkpointSummary(source.conversation),
         currentPrompt,
-        input.modelContextTokens,
+        budgetPolicy,
+        true,
+        sourceBudget,
         true,
       );
       if (!compression.selection.summarySource.length
@@ -224,21 +239,18 @@ export class ChatContextService {
         contextCheckpointId: draft.id,
         contextCheckpointDraft: draft,
         mode: 'checkpoint-handoff',
-        notice: '已压缩较早对话，完整聊天记录仍然保留。',
+        notice: '上下文接近上限，已整理较早对话；完整记录仍保留。',
       };
     }
 
     if (needsFreshHandoff) {
-      if (!source.safe) {
-        const full = await this.options.store.getConversation(conversationId);
-        if (!full) throw new Error(`Conversation ${conversationId} was not found.`);
-        source = deriveFullSource(full);
-      }
       const compression = this.chooseSafeCompression(
         source.projection,
         checkpointSummary(source.conversation),
         currentPrompt,
-        input.modelContextTokens,
+        budgetPolicy,
+        false,
+        sourceBudget,
         false,
       );
       const freshSessionPrompt = appendCurrentPrompt(
@@ -258,21 +270,18 @@ export class ChatContextService {
           ? { contextCheckpointId: source.conversation.contextCheckpoint.id }
           : {}),
         mode: 'fresh-handoff',
-        notice: `已整理上下文，${agentDisplayName(input.targetAgentId)} 将从这里继续。`,
+        notice: '',
       };
     }
 
     if (codexFallbackNeeded) {
-      if (!source.safe) {
-        const full = await this.options.store.getConversation(conversationId);
-        if (!full) throw new Error(`Conversation ${conversationId} was not found.`);
-        source = deriveFullSource(full);
-      }
       const compression = this.chooseSafeCompression(
         source.projection,
         checkpointSummary(source.conversation),
         currentPrompt,
-        input.modelContextTokens,
+        budgetPolicy,
+        false,
+        sourceBudget,
         false,
       );
       const freshSessionPrompt = appendCurrentPrompt(
@@ -297,7 +306,7 @@ export class ChatContextService {
       };
     }
 
-    this.assertCurrentPromptFits(currentPrompt, input.modelContextTokens);
+    if (sourceBudget.overHardLimit) throw new ChatContextOverflowError();
     return {
       effectivePrompt: currentPrompt,
       sourceRevision: source.conversation.revision,
@@ -312,10 +321,19 @@ export class ChatContextService {
     projection: CompletedConversationProjection,
     previousSummary: ConversationContextSummary | undefined,
     currentPrompt: string,
-    modelContextTokens: number | undefined,
+    budgetPolicy: ContextBudgetPolicy,
     requireCheckpointBoundary: boolean,
+    sourceBudget: ContextBudgetEstimate,
+    requireHeadroom: boolean,
   ): CompressionMaterial {
-    const maxTail = Math.min(this.rawTailTurns, projection.turns.length);
+    const tokenBounded = selectRawTailByTokenBudget(projection, this.rawTailTokens);
+    const maxTail = Math.min(
+      tokenBounded.rawTail.length,
+      this.rawTailTurnCap ?? projection.turns.length,
+    );
+    const target = requireHeadroom
+      ? compactionTarget(sourceBudget)
+      : { tokens: sourceBudget.softLimitTokens, bytes: sourceBudget.softLimitBytes };
     for (let tailTurns = maxTail; tailTurns >= 0; tailTurns -= 1) {
       const selection = selectCheckpointSafeTail(projection, tailTurns);
       if (requireCheckpointBoundary && selection.summarySource.length === 0) continue;
@@ -323,7 +341,10 @@ export class ChatContextService {
         ...projection,
         turns: selection.summarySource,
       });
-      const summary = mergeContextSummaries(previousSummary, summaryDelta);
+      const summary = trimSummaryToTokenBudget(
+        mergeContextSummaries(previousSummary, summaryDelta),
+        this.summaryTokenLimit,
+      );
       const compactedProjection: CompletedConversationProjection = {
         ...projection,
         turns: selection.rawTail,
@@ -331,26 +352,28 @@ export class ChatContextService {
       const budget = estimateContextBudget({
         projection: compactedProjection,
         previousSummary: summary,
-        additionalText: [currentPrompt],
-        modelContextTokens: modelContextTokens ?? DEFAULT_UNKNOWN_CONTEXT_TOKENS,
-        softRatio: this.softContextRatio,
-        hardRatio: this.hardContextRatio,
-        safetyFactor: this.safetyFactor,
+        additionalText: [...budgetPolicy.requestOverheadText, currentPrompt],
+        ...budgetEstimateOptions(budgetPolicy, this.safetyFactor),
       });
-      if (!budget.overHardLimit) return { selection, summary };
+      if (
+        !budget.overHardLimit
+        && budget.estimatedTokens <= target.tokens
+        && budget.estimatedBytes <= target.bytes
+        && (!requireHeadroom || hasMeaningfulCompressionProgress(sourceBudget, budget, target))
+      ) return { selection, summary, budget };
     }
     throw new ChatContextOverflowError();
   }
 
-  private assertCurrentPromptFits(currentPrompt: string, modelContextTokens: number | undefined): void {
+  private assertCurrentPromptFits(
+    currentPrompt: string,
+    budgetPolicy: ContextBudgetPolicy,
+  ): void {
     const budget = estimateContextBudget({
-      additionalText: [currentPrompt],
-      modelContextTokens: modelContextTokens ?? DEFAULT_UNKNOWN_CONTEXT_TOKENS,
-      softRatio: this.softContextRatio,
-      hardRatio: this.hardContextRatio,
-      safetyFactor: this.safetyFactor,
+      additionalText: [...budgetPolicy.requestOverheadText, currentPrompt],
+      ...budgetEstimateOptions(budgetPolicy, this.safetyFactor),
     });
-    if (budget.overHardLimit) throw new ChatContextOverflowError();
+    if (budget.overSoftLimit) throw new ChatContextOverflowError();
   }
 }
 
@@ -363,6 +386,136 @@ interface CanonicalProjectionSource {
 interface CompressionMaterial {
   selection: ContextTailSelection;
   summary: ConversationContextSummary;
+  budget: ContextBudgetEstimate;
+}
+
+interface ContextBudgetPolicy {
+  modelContextTokens: number;
+  outputReserveTokens: number;
+  hardOutputReserveTokens: number;
+  requestOverheadText: readonly string[];
+  reservedTokens: number;
+  reservedBytes: number;
+  maxRequestBytes: number;
+}
+
+function resolveBudgetPolicy(input: PrepareChatContextInput): ContextBudgetPolicy {
+  return {
+    modelContextTokens: positiveInteger(
+      input.modelContextTokens,
+      DEFAULT_UNKNOWN_CONTEXT_TOKENS,
+    ),
+    outputReserveTokens: positiveInteger(
+      input.modelOutputReserveTokens,
+      DEFAULT_MODEL_OUTPUT_RESERVE_TOKENS,
+    ),
+    hardOutputReserveTokens: positiveInteger(
+      input.hardOutputReserveTokens,
+      DEFAULT_HARD_OUTPUT_RESERVE_TOKENS,
+    ),
+    requestOverheadText: input.requestOverheadText?.filter(Boolean) ?? [],
+    reservedTokens: nonNegativeInteger(input.reservedInputTokens, 0),
+    reservedBytes: nonNegativeInteger(input.reservedRequestBytes, 0),
+    maxRequestBytes: positiveInteger(input.maxRequestBytes, DEFAULT_MAX_REQUEST_BYTES),
+  };
+}
+
+function budgetEstimateOptions(
+  policy: ContextBudgetPolicy,
+  safetyFactor: number,
+): Pick<
+  Parameters<typeof estimateContextBudget>[0],
+  | 'modelContextTokens'
+  | 'outputReserveTokens'
+  | 'hardOutputReserveTokens'
+  | 'reservedTokens'
+  | 'reservedBytes'
+  | 'maxRequestBytes'
+  | 'safetyFactor'
+> {
+  return {
+    modelContextTokens: policy.modelContextTokens,
+    outputReserveTokens: policy.outputReserveTokens,
+    hardOutputReserveTokens: policy.hardOutputReserveTokens,
+    reservedTokens: policy.reservedTokens,
+    reservedBytes: policy.reservedBytes,
+    maxRequestBytes: policy.maxRequestBytes,
+    safetyFactor,
+  };
+}
+
+function compactionTarget(budget: ContextBudgetEstimate): { tokens: number; bytes: number } {
+  const tokenHeadroom = Math.min(
+    Math.max(1, Math.floor(budget.softLimitTokens / 3)),
+    Math.max(8_000, Math.floor(budget.contextWindowTokens * 0.1)),
+  );
+  const byteHeadroom = Math.min(
+    Math.max(1, Math.floor(budget.softLimitBytes / 4)),
+    128 * 1024,
+  );
+  return {
+    tokens: Math.max(1, budget.softLimitTokens - tokenHeadroom),
+    bytes: Math.max(1, budget.softLimitBytes - byteHeadroom),
+  };
+}
+
+function hasMeaningfulCompressionProgress(
+  source: ContextBudgetEstimate,
+  compacted: ContextBudgetEstimate,
+  target: { tokens: number; bytes: number },
+): boolean {
+  const tokenReduction = source.estimatedTokens - compacted.estimatedTokens;
+  const byteReduction = source.estimatedBytes - compacted.estimatedBytes;
+  const requiredTokenReduction = Math.min(
+    4_000,
+    Math.max(1, source.estimatedTokens - target.tokens),
+  );
+  const requiredByteReduction = Math.min(
+    64 * 1024,
+    Math.max(1, source.estimatedBytes - target.bytes),
+  );
+  if (source.overSoftTokenLimit && tokenReduction < requiredTokenReduction) return false;
+  if (source.overSoftByteLimit && byteReduction < requiredByteReduction) return false;
+  if (!source.overSoftTokenLimit && !source.overSoftByteLimit) {
+    return tokenReduction > 0 || byteReduction > 0;
+  }
+  return true;
+}
+
+function trimSummaryToTokenBudget(
+  summary: ConversationContextSummary,
+  maxTokens: number,
+): ConversationContextSummary {
+  const trimmed: ConversationContextSummary = {
+    facts: [...summary.facts],
+    decisions: [...summary.decisions],
+    userPreferences: [...summary.userPreferences],
+    constraints: [...summary.constraints],
+    openLoops: [...summary.openLoops],
+    filesMentioned: [...summary.filesMentioned],
+    lastIntent: summary.lastIntent,
+  };
+  // Discard lower-value/older material first. Constraints, open work and the
+  // latest intent are the last things a continuation should lose.
+  const discardOrder = [
+    'facts',
+    'filesMentioned',
+    'decisions',
+    'userPreferences',
+    'openLoops',
+    'constraints',
+  ] as const;
+  while (estimateContextTokens(JSON.stringify(trimmed)) > maxTokens) {
+    const candidate = discardOrder.find(key => trimmed[key].length > 0);
+    if (candidate) {
+      trimmed[candidate].shift();
+      continue;
+    }
+    if (!trimmed.lastIntent) break;
+    const characters = Array.from(trimmed.lastIntent);
+    trimmed.lastIntent = characters.slice(Math.ceil(characters.length / 4)).join('');
+  }
+  return trimmed;
 }
 
 function deriveWindowSource(window: ConversationWindow): CanonicalProjectionSource {
@@ -465,11 +618,6 @@ function appendCurrentPrompt(handoff: string, currentPrompt: string): string {
   return `${handoff}\n\n当前回合输入：\n${currentPrompt}`;
 }
 
-function agentDisplayName(agentId: AgentId): string {
-  if (agentId === 'claude') return 'Claude Code';
-  return 'Codex';
-}
-
 function requireText(value: string, label: string): string {
   const normalized = value.trim();
   if (!normalized) throw new TypeError(`${label} must not be empty.`);
@@ -486,10 +634,4 @@ function positiveInteger(value: number | undefined, fallback: number): number {
 
 function positiveNumber(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) && Number(value) > 0 ? Number(value) : fallback;
-}
-
-function boundedRatio(value: number | undefined, fallback: number): number {
-  return Number.isFinite(value) && Number(value) > 0 && Number(value) < 1
-    ? Number(value)
-    : fallback;
 }

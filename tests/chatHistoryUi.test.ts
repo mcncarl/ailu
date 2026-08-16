@@ -18,12 +18,14 @@ vi.mock('obsidian', () => ({
 
 import type { ConversationSummary } from '../src/storage/vaultStore';
 import type { ChatMessage } from '../src/types';
+import { ChatContextOverflowError } from '../src/chat';
 import {
   ConversationUiOperationGate,
   getConversationArchiveBlockReason,
   loadPersistedMessagesThroughAnchor,
   mergeConversationMessages,
   mergeConversationSummaries,
+  prepareNewConversationContext,
   resolveHistoryConversationIcon,
 } from '../src/ui/chatView';
 
@@ -53,6 +55,24 @@ function summary(id: string, revision: number): ConversationSummary {
 }
 
 describe('chat history UI merge helpers', () => {
+  test('preflights the complete first request against the selected model capacity', () => {
+    expect(prepareNewConversationContext({
+      currentPrompt: 'a'.repeat(700_000),
+      systemPrompt: 'Keep the answer concise.',
+      modelContextTokens: 1_000_000,
+      modelOutputReserveTokens: 128_000,
+      reservedInputTokens: 8_000,
+    }).mode).toBe('new-conversation');
+
+    expect(() => prepareNewConversationContext({
+      currentPrompt: '中'.repeat(40_000),
+      systemPrompt: 'Keep the answer concise.',
+      modelContextTokens: 32_000,
+      modelOutputReserveTokens: 8_000,
+      reservedInputTokens: 8_000,
+    })).toThrow(ChatContextOverflowError);
+  });
+
   test('keeps loaded earlier messages when a later live snapshot only contains the recent window', () => {
     const loaded = [message('m1', 'old'), message('m2', 'checkpoint-old'), message('m3', 'recent')];
     const live = [message('m2', 'checkpoint-new'), message('m3', 'recent'), message('m4', 'streaming')];

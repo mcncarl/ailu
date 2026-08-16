@@ -2,7 +2,13 @@ import { Editor, ItemView, MarkdownRenderer, MarkdownView, Menu, Notice, setIcon
 
 import { getAgentDescriptor, SELECTABLE_AGENT_IDS } from '../agents';
 import {
+  DEFAULT_ATTACHMENT_RESERVE_TOKENS,
+  DEFAULT_NATIVE_RUNTIME_OVERHEAD_TOKENS,
+  ChatContextOverflowError,
   ChatPersistenceBackpressureError,
+  estimateContextBudget,
+  resolveModelContextCapacity,
+  type ChatContextPreparation,
   type ChatContextService,
   type ChatConversationSnapshot,
   type ChatConversationWatch,
@@ -2916,6 +2922,26 @@ export class AiluChatView extends ItemView {
         ccSwitchSnapshot?.routeFingerprint,
       )
       : null;
+    const codexStatus = agentId === 'codex'
+      ? this.deps.runtimeManager.getCodexStatus()
+      : null;
+    const modelContextCapacity = resolveModelContextCapacity({
+      agentId,
+      configSource,
+      cliModel: agentId === 'codex'
+        ? codexStatus?.currentModelId
+        : configSource === 'ccSwitchCurrent'
+          ? ccSwitchSessionConfig?.cliModel
+          : resolvedLocalClaudeModel?.cliModel ?? modelOverride,
+      routedModel: configSource === 'ccSwitchCurrent'
+        ? ccSwitchSnapshot?.currentModel
+        : resolvedLocalClaudeModel?.routedModel,
+      providerModel: providerProfile?.defaultModel || providerProfile?.model,
+      runtimeContextWindowTokens: codexStatus?.contextWindowTokens
+        ?? codexStatus?.currentModel?.contextWindowTokens,
+      runtimeAutoCompactTokenLimit: codexStatus?.autoCompactTokenLimit
+        ?? codexStatus?.currentModel?.autoCompactTokenLimit,
+    });
     const claudeSessionConfigKey = agentId === 'claude'
       ? buildClaudeSessionConfigKey({
         configSource,
@@ -2966,6 +2992,8 @@ export class AiluChatView extends ItemView {
       .filter(Boolean)
       .join('\n\n');
     const attachments = mergeAttachments([...resolvedAttachments, ...activeContext.attachments]);
+    const reservedInputTokens = DEFAULT_NATIVE_RUNTIME_OVERHEAD_TOKENS
+      + attachments.length * DEFAULT_ATTACHMENT_RESERVE_TOKENS;
     const userMessage: ChatMessage = {
       id: createId('msg'),
       role: 'user',
@@ -3002,18 +3030,22 @@ export class AiluChatView extends ItemView {
     // It has no history to hand off, so avoid turning the first send into a
     // failed repository lookup.
     const preparedContext = conversation.messages.length === 0
-      ? {
-        effectivePrompt: runtimePrompt,
-        sessionId: undefined,
-        allowFreshSessionFallback: false,
-        mode: 'new-conversation' as const,
-        notice: '',
-      }
+      ? prepareNewConversationContext({
+        currentPrompt: runtimePrompt,
+        systemPrompt: settings.systemPrompt,
+        modelContextTokens: modelContextCapacity.contextWindowTokens,
+        modelOutputReserveTokens: modelContextCapacity.outputReserveTokens,
+        reservedInputTokens,
+      })
       : await this.deps.chatContextService.prepare({
         conversationId: conversation.id,
         targetAgentId: agentId,
         currentPrompt: runtimePrompt,
         resumeCandidate: sessionId,
+        modelContextTokens: modelContextCapacity.contextWindowTokens,
+        modelOutputReserveTokens: modelContextCapacity.outputReserveTokens,
+        requestOverheadText: [settings.systemPrompt],
+        reservedInputTokens,
       });
     this.deps.chatRunCoordinator.assertContextPreparationAllowed(conversation.id);
     if (this.deps.chatRunCoordinator.isConversationRunning(conversation.id)) {
@@ -3863,6 +3895,30 @@ export function getConversationArchiveBlockReason(
   }
   if (running) return '这段对话仍在后台运行，完成或停止后才能归档。';
   return null;
+}
+
+/** Apply the same complete-request budget before the first durable turn exists. */
+export function prepareNewConversationContext(input: {
+  currentPrompt: string;
+  systemPrompt?: string;
+  modelContextTokens: number;
+  modelOutputReserveTokens: number;
+  reservedInputTokens: number;
+}): ChatContextPreparation {
+  const budget = estimateContextBudget({
+    additionalText: [input.systemPrompt ?? '', input.currentPrompt],
+    modelContextTokens: input.modelContextTokens,
+    outputReserveTokens: input.modelOutputReserveTokens,
+    reservedTokens: input.reservedInputTokens,
+  });
+  if (budget.overSoftLimit) throw new ChatContextOverflowError();
+  return {
+    effectivePrompt: input.currentPrompt,
+    sessionId: undefined,
+    allowFreshSessionFallback: false,
+    mode: 'new-conversation',
+    notice: '',
+  };
 }
 
 export function resolveHistoryConversationIcon(options: {

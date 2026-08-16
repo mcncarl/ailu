@@ -51,4 +51,14 @@ describe('chat composer UI contract', () => {
     expect(chatViewSource).toContain('&& this.deps.isMemoryRuntimeReady()');
     expect(chatViewSource).not.toContain('new Notice(`Agent Memory 已禁用：');
   });
+
+  it('passes the selected model capacity and complete request overhead into context preparation', () => {
+    expect(chatViewSource).toContain('resolveModelContextCapacity({');
+    expect(chatViewSource).toContain('modelContextTokens: modelContextCapacity.contextWindowTokens');
+    expect(chatViewSource).toContain('modelOutputReserveTokens: modelContextCapacity.outputReserveTokens');
+    expect(chatViewSource).toContain('requestOverheadText: [settings.systemPrompt]');
+    expect(chatViewSource).toContain('DEFAULT_NATIVE_RUNTIME_OVERHEAD_TOKENS');
+    expect(chatViewSource).toContain('prepareNewConversationContext({');
+    expect(chatViewSource).not.toContain('已压缩较早对话，完整聊天记录仍然保留。');
+  });
 });

@@ -13,9 +13,11 @@ import {
   parseConversationContextSummary,
   planContextCheckpoint,
   projectCompletedConversation,
+  resolveModelContextCapacity,
   sanitizeConversationContextSummary,
   sanitizeVisibleContextText,
   selectRawTail,
+  selectRawTailByTokenBudget,
   TOOL_LIFECYCLE_CONTENT_METADATA_KEY,
   withoutToolLifecycleDisplayText,
 } from '../src/chat/contextCompression';
@@ -330,6 +332,23 @@ describe('context compression projection', () => {
     expect(selection.summarySource.at(-1)?.queueSequence).toBe(300);
   });
 
+  it('keeps a token-bounded recent tail instead of a fixed number of turns', () => {
+    const projection = projectCompletedConversation(conversationFrom([
+      { user: '短问题 1', assistant: '短回答 1' },
+      { user: '短问题 2', assistant: '短回答 2' },
+      { user: '短问题 3', assistant: '短回答 3' },
+      { user: '长问题', assistant: '中'.repeat(1_500) },
+      { user: '最后问题', assistant: '最后回答' },
+    ]));
+
+    const compact = selectRawTailByTokenBudget(projection, 120);
+    const roomy = selectRawTailByTokenBudget(projection, 5_000);
+
+    expect(compact.rawTail.map(turn => turn.turnId)).toEqual(['turn-5']);
+    expect(compact.summarySource.at(-1)?.turnId).toBe('turn-4');
+    expect(roomy.rawTail).toHaveLength(5);
+  });
+
   it('preserves canonical message sequences when projecting a recent window', () => {
     const windowed = conversationFrom([
       { user: 'u-451', assistant: 'a-451' },
@@ -389,6 +408,75 @@ describe('context budget estimation', () => {
     expect(estimate.hardLimitTokens).toBe(1_600);
     expect(estimate.overSoftLimit).toBe(true);
     expect(estimate.overHardLimit).toBe(false);
+  });
+
+  it('uses an absolute output buffer without imposing a premature 1 MiB request ceiling', () => {
+    const estimate = estimateContextBudget({
+      additionalText: ['a'.repeat(700_000)],
+      modelContextTokens: 1_000_000,
+      outputReserveTokens: 20_000,
+      hardOutputReserveTokens: 4_000,
+      safetyFactor: 1,
+    });
+
+    expect(estimate.softLimitTokens).toBe(980_000);
+    expect(estimate.hardLimitTokens).toBe(996_000);
+    expect(estimate.overSoftTokenLimit).toBe(false);
+    expect(estimate.overSoftByteLimit).toBe(false);
+
+    const byteOverflow = estimateContextBudget({
+      additionalText: ['a'.repeat(800_000)],
+      modelContextTokens: 1_000_000,
+      outputReserveTokens: 20_000,
+      maxRequestBytes: 1024 * 1024,
+      safetyFactor: 1,
+    });
+    expect(byteOverflow.overSoftTokenLimit).toBe(false);
+    expect(byteOverflow.overSoftByteLimit).toBe(true);
+    expect(byteOverflow.overSoftLimit).toBe(true);
+  });
+});
+
+describe('model context capacity resolution', () => {
+  it('honors the exact Claude 1M alias used by CC Switch', () => {
+    expect(resolveModelContextCapacity({
+      agentId: 'claude',
+      configSource: 'ccSwitchCurrent',
+      cliModel: 'sonnet[1m]',
+      routedModel: 'deepseek-v4-flash',
+    })).toEqual({
+      contextWindowTokens: 1_000_000,
+      outputReserveTokens: 128_000,
+      source: 'declared-alias',
+    });
+  });
+
+  it('uses known Claude families, conservative defaults, and live Codex metadata', () => {
+    expect(resolveModelContextCapacity({
+      agentId: 'claude',
+      configSource: 'providerProfile',
+      providerModel: 'claude-sonnet-4-6',
+    }).contextWindowTokens).toBe(1_000_000);
+    expect(resolveModelContextCapacity({
+      agentId: 'claude',
+      configSource: 'providerProfile',
+      providerModel: 'unknown-third-party-model',
+    })).toEqual({
+      contextWindowTokens: 32_000,
+      outputReserveTokens: 8_000,
+      source: 'unknown',
+    });
+    expect(resolveModelContextCapacity({
+      agentId: 'codex',
+      configSource: 'localCli',
+      cliModel: 'gpt-5.6-sol',
+      runtimeContextWindowTokens: 353_400,
+      runtimeAutoCompactTokenLimit: 334_800,
+    })).toEqual({
+      contextWindowTokens: 353_400,
+      outputReserveTokens: 18_600,
+      source: 'runtime',
+    });
   });
 });
 
@@ -566,6 +654,7 @@ describe('session freshness and checkpoint planning', () => {
       conversation,
       targetAgentId: 'claude',
       checkpointTurnLimit: 9,
+      rawTailTurns: 6,
     });
 
     expect(plan.action).toBe('checkpoint');
@@ -599,6 +688,7 @@ describe('session freshness and checkpoint planning', () => {
       conversation,
       targetAgentId: 'claude',
       checkpointTurnLimit: 7,
+      rawTailTurns: 6,
     });
 
     expect(plan.projection.turns.map(turn => turn.turnId)).toEqual([
