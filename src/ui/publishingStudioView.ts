@@ -16,6 +16,7 @@ import {
   DraftCreatedVerificationError,
   getWeChatPublishingAdvisories,
   LocalRelayTransport,
+  prepareInformationOsPublicationPackage,
   prepareSnapshotForPublishing,
   selectCoverAsset,
   type PreparedArticle,
@@ -58,6 +59,10 @@ import {
   type WeChatTypographyPreferences,
 } from '../wechat/typography';
 import { confirmDraftUpload } from './confirmDraftUploadModal';
+import {
+  openInformationOsPackageImport,
+  type InformationOsPackagePublishResult,
+} from './informationOsPackageImportModal';
 import { FeishuPublishingPanel } from './feishuPublishingPanel';
 import { XPublishingPanel } from './xPublishingPanel';
 import type { XArticleUploadTaskCoordinator } from '../xArticle/uploadTaskCoordinator';
@@ -1111,6 +1116,11 @@ export class PublishingStudioView extends ItemView {
 
   private renderActions(parent: HTMLElement): void {
     const actions = parent.createDiv({ cls: 'ailu-publishing-actions' });
+    const importPackage = actions.createEl('button', {
+      text: '导入 InformationOS 包',
+      attr: { type: 'button' },
+    });
+    importPackage.onclick = () => void this.importInformationOsPackage();
     const copy = actions.createEl('button', { text: '复制排版', attr: { type: 'button' } });
     copy.onclick = () => void this.copyPreview();
     const preflight = actions.createEl('button', { text: '检查草稿', attr: { type: 'button' } });
@@ -1583,6 +1593,102 @@ export class PublishingStudioView extends ItemView {
     } finally {
       this.operation = null;
       await this.finishWeChatOperation();
+    }
+  }
+
+  private async importInformationOsPackage(): Promise<void> {
+    if (this.operation) {
+      this.reserveWeChatOperation('preflight');
+      return;
+    }
+    if (this.deps.getSettings().publishing.transport !== 'localRelay') {
+      new Notice('当前安全版本仅开放自托管公众号中转，请在草稿设置中切换。');
+      return;
+    }
+    if (!this.reserveWeChatOperation('preflight')) return;
+    this.statusText = '等待选择 InformationOS 发布包…';
+    await this.renderWeChatOperationState();
+    try {
+      const result = await openInformationOsPackageImport(this.app, {
+        prepare: packagePath => prepareInformationOsPublicationPackage(packagePath),
+        publish: prepared => this.publishImportedInformationOsPackage(prepared),
+      });
+      if (result.status === 'succeeded') {
+        this.statusText = `《${result.title}》草稿已创建并回读验证：${result.draftMediaId}`;
+        new Notice(`《${result.title}》草稿已创建，${result.uploadedImageCount} 张正文图片已核验。`);
+      } else if (result.status === 'remote_unknown') {
+        this.statusText = `草稿 ${result.draftMediaId} 已返回，但回读未通过；请先核对草稿箱，勿直接重试`;
+        new Notice('公众号草稿可能已创建，但回读校验未通过；请先核对草稿箱。', 0);
+      } else {
+        this.statusText = '';
+      }
+    } finally {
+      this.operation = null;
+      await this.finishWeChatOperation();
+    }
+  }
+
+  private async publishImportedInformationOsPackage(
+    prepared: PreparedArticle,
+  ): Promise<InformationOsPackagePublishResult | null> {
+    assertPreparedArticleReady(prepared);
+    const destination = this.currentPublicationDestination();
+    const advisories = getWeChatPublishingAdvisories(prepared.stats.imageCount);
+    const confirmed = await confirmDraftUpload(this.app, {
+      title: prepared.title,
+      transportLabel: 'InformationOS 发布包 · 自托管公众号中转',
+      accountLabel: maskedPublishingAppId(destination.identity.appId),
+      relayHost: destination.identity.relayHost,
+      imageCount: prepared.stats.imageCount,
+      compressedImageCount: prepared.stats.compressedImageCount,
+      warningCount: advisories.length,
+      warnings: advisories.map(advisory => advisory.message),
+    });
+    if (!confirmed) return null;
+
+    let currentDestination: PublishingDestinationIdentity | null = null;
+    try {
+      currentDestination = this.currentPublicationDestination().identity;
+    } catch {
+      currentDestination = null;
+    }
+    assertPublishingDestinationUnchanged(destination.identity, currentDestination);
+    this.operation = 'publishing';
+    this.statusText = `正在上传《${prepared.title}》的封面与正文图片，并创建草稿…`;
+    await this.renderWeChatOperationState();
+
+    try {
+      currentDestination = null;
+      try {
+        currentDestination = this.currentPublicationDestination().identity;
+      } catch {
+        currentDestination = null;
+      }
+      assertPublishingDestinationUnchanged(destination.identity, currentDestination);
+      const transport = new LocalRelayTransport({
+        relayUrl: destination.identity.relayUrl,
+        relayToken: destination.relayToken,
+        request: request => this.relayRequest(request),
+      });
+      const result = await transport.publish(prepared, {
+        idempotencyKey: prepared.contentHash,
+      });
+      return {
+        status: 'succeeded',
+        draftMediaId: result.draftMediaId,
+        uploadedImageCount: result.uploadedImageCount,
+      };
+    } catch (error) {
+      if (error instanceof DraftCreatedVerificationError) {
+        return {
+          status: 'remote_unknown',
+          draftMediaId: error.draftMediaId,
+        };
+      }
+      throw error;
+    } finally {
+      if (this.operation === 'publishing') this.operation = 'preflight';
+      this.refreshTargetButtons();
     }
   }
 

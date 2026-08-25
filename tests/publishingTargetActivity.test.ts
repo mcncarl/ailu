@@ -94,7 +94,7 @@ describe('publishing target concurrency UI contract', () => {
     expect(identityBody).toContain('renderedHtml: this.preparedRenderedHtml');
 
     const postPreparationGuard = publishingStudioSource.match(
-      /const prepared = await prepareSnapshotForPublishing[\s\S]*?if \(([\s\S]*?)\) \{\n\s{6}throw new Error\('文章或排版在检查期间已变化，请重新检查'\);/,
+      /const prepared = await prepareSnapshotForPublishing[\s\S]*?if \(([\s\S]*?)\) \{\r?\n\s{6}throw new Error\('文章或排版在检查期间已变化，请重新检查'\);/,
     )?.[1] ?? '';
     expect(postPreparationGuard).not.toContain('articleEl !== this.articleEl');
     expect(postPreparationGuard).not.toContain('this.articleEl.innerHTML');
