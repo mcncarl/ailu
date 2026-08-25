@@ -44,6 +44,32 @@ const REQUIRED_ROOT_ENTRIES = new Set<string>([
 ]);
 
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+const INFORMATION_OS_IDENTIFIER_PATTERN = /^[A-Za-z0-9_-]+$/u;
+const INFORMATION_OS_FILE_HASH_REFERENCE_PATTERN = /^(?:article\.md|article\.html|article\.txt|source-references\.json|publishing-checklist\.md|(?:assets|cover)\/[A-Za-z0-9][A-Za-z0-9._/-]{0,240})$/u;
+const RFC3339_DATE_TIME_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/u;
+const REQUIRED_METADATA_KEYS = [
+  'schema_version',
+  'export_id',
+  'draft_id',
+  'draft_version',
+  'title',
+  'digest',
+  'content_hash',
+  'asset_manifest_hash',
+  'file_hashes',
+  'created_at',
+] as const;
+const OPTIONAL_METADATA_KEYS = [
+  'selected_angle',
+  'target_audience',
+  'fact_claims',
+  'risk_flags',
+  'suggested_cover_brief',
+] as const;
+const ALLOWED_METADATA_KEYS = new Set<string>([
+  ...REQUIRED_METADATA_KEYS,
+  ...OPTIONAL_METADATA_KEYS,
+]);
 const WINDOWS_RESERVED_SEGMENT = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu;
 const WINDOWS_UNSUPPORTED_SEGMENT = /[<>:"|?*]/u;
 const WINDOWS_TRAILING_DOT_OR_SPACE = /[. ]$/u;
@@ -113,16 +139,17 @@ interface PackageMetadata {
   export_id: string;
   draft_id: string;
   draft_version: number;
+  title: string;
+  digest: string;
   content_hash: string;
   asset_manifest_hash: string;
   created_at: string;
   file_hashes: Record<string, string>;
-  title?: string;
-  digest?: string;
-  author?: string;
-  content_source_url?: string;
-  need_open_comment?: boolean;
-  only_fans_can_comment?: boolean;
+  selected_angle?: string | null;
+  target_audience?: string | null;
+  fact_claims?: string[];
+  risk_flags?: string[];
+  suggested_cover_brief?: string | null;
 }
 
 interface LoadedPackage {
@@ -343,6 +370,48 @@ function assertHash(value: unknown): asserts value is string {
   if (typeof value !== 'string' || !HASH_PATTERN.test(value)) fail('PACKAGE_METADATA_INVALID');
 }
 
+function boundedString(value: unknown, minimum: number, maximum: number): value is string {
+  if (typeof value !== 'string') return false;
+  const length = [...value].length;
+  return length >= minimum && length <= maximum;
+}
+
+function nullableBoundedString(value: unknown, maximum: number): value is string | null {
+  return value === null || boundedString(value, 0, maximum);
+}
+
+function boundedStringArray(value: unknown, maximumItems: number, maximumLength: number): value is string[] {
+  return Array.isArray(value)
+    && value.length <= maximumItems
+    && value.every(item => boundedString(item, 0, maximumLength));
+}
+
+function validRfc3339DateTime(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = value.match(RFC3339_DATE_TIME_PATTERN);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const offsetHour = match[7] === undefined ? 0 : Number(match[7]);
+  const offsetMinute = match[8] === undefined ? 0 : Number(match[8]);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year > 0
+    && month >= 1
+    && month <= 12
+    && day >= 1
+    && day <= (daysInMonth[month - 1] ?? 0)
+    && hour <= 23
+    && minute <= 59
+    && second <= 60
+    && offsetHour <= 23
+    && offsetMinute <= 59;
+}
+
 function parseMetadata(bytes: Uint8Array): PackageMetadata {
   let parsed: unknown;
   try {
@@ -352,33 +421,44 @@ function parseMetadata(bytes: Uint8Array): PackageMetadata {
   }
   if (!isObject(parsed)) fail('PACKAGE_METADATA_INVALID');
   const record = parsed;
+  const metadataKeys = Object.keys(record);
   if (
-    record.schema_version !== INFORMATION_OS_PUBLICATION_PACKAGE_SCHEMA_VERSION
-    || typeof record.export_id !== 'string'
-    || typeof record.draft_id !== 'string'
+    metadataKeys.some(key => !ALLOWED_METADATA_KEYS.has(key))
+    || REQUIRED_METADATA_KEYS.some(key => !Object.hasOwn(record, key))
+    || record.schema_version !== INFORMATION_OS_PUBLICATION_PACKAGE_SCHEMA_VERSION
+    || !boundedString(record.export_id, 1, 200)
+    || !INFORMATION_OS_IDENTIFIER_PATTERN.test(record.export_id)
+    || !boundedString(record.draft_id, 1, 200)
+    || !INFORMATION_OS_IDENTIFIER_PATTERN.test(record.draft_id)
     || !Number.isSafeInteger(record.draft_version)
     || (record.draft_version as number) < 1
-    || typeof record.created_at !== 'string'
+    || !boundedString(record.title, 1, 200)
+    || !boundedString(record.digest, 0, 500)
+    || !validRfc3339DateTime(record.created_at)
   ) fail('PACKAGE_METADATA_INVALID');
   assertHash(record.content_hash);
   assertHash(record.asset_manifest_hash);
   if (!isObject(record.file_hashes)) fail('PACKAGE_METADATA_INVALID');
   const fileHashes: Record<string, string> = {};
-  for (const [reference, hash] of Object.entries(record.file_hashes)) {
-    if (!safePackageReference(reference)) fail('PACKAGE_METADATA_INVALID');
+  const fileHashEntries = Object.entries(record.file_hashes);
+  if (fileHashEntries.length < 5 || fileHashEntries.length > 56) {
+    fail('PACKAGE_METADATA_INVALID');
+  }
+  for (const [reference, hash] of fileHashEntries) {
+    if (
+      !INFORMATION_OS_FILE_HASH_REFERENCE_PATTERN.test(reference)
+      || !safePackageReference(reference)
+    ) fail('PACKAGE_METADATA_INVALID');
     assertHash(hash);
     fileHashes[reference] = hash;
   }
-  if (Object.keys(fileHashes).length === 0) fail('PACKAGE_METADATA_INVALID');
-
-  const optionalStrings = ['title', 'digest', 'author', 'content_source_url'] as const;
-  for (const key of optionalStrings) {
-    if (record[key] !== undefined && typeof record[key] !== 'string') {
+  for (const key of ['selected_angle', 'target_audience', 'suggested_cover_brief'] as const) {
+    if (record[key] !== undefined && !nullableBoundedString(record[key], 4_000)) {
       fail('PACKAGE_METADATA_INVALID');
     }
   }
-  for (const key of ['need_open_comment', 'only_fans_can_comment'] as const) {
-    if (record[key] !== undefined && typeof record[key] !== 'boolean') {
+  for (const key of ['fact_claims', 'risk_flags'] as const) {
+    if (record[key] !== undefined && !boundedStringArray(record[key], 256, 4_000)) {
       fail('PACKAGE_METADATA_INVALID');
     }
   }
@@ -387,22 +467,27 @@ function parseMetadata(bytes: Uint8Array): PackageMetadata {
     export_id: record.export_id,
     draft_id: record.draft_id,
     draft_version: record.draft_version as number,
+    title: record.title,
+    digest: record.digest,
     content_hash: record.content_hash,
     asset_manifest_hash: record.asset_manifest_hash,
     created_at: record.created_at,
     file_hashes: fileHashes,
-    ...(typeof record.title === 'string' ? { title: record.title } : {}),
-    ...(typeof record.digest === 'string' ? { digest: record.digest } : {}),
-    ...(typeof record.author === 'string' ? { author: record.author } : {}),
-    ...(typeof record.content_source_url === 'string'
-      ? { content_source_url: record.content_source_url }
-      : {}),
-    ...(typeof record.need_open_comment === 'boolean'
-      ? { need_open_comment: record.need_open_comment }
-      : {}),
-    ...(typeof record.only_fans_can_comment === 'boolean'
-      ? { only_fans_can_comment: record.only_fans_can_comment }
-      : {}),
+    ...(record.selected_angle === undefined
+      ? {}
+      : { selected_angle: record.selected_angle as string | null }),
+    ...(record.target_audience === undefined
+      ? {}
+      : { target_audience: record.target_audience as string | null }),
+    ...(record.fact_claims === undefined
+      ? {}
+      : { fact_claims: record.fact_claims as string[] }),
+    ...(record.risk_flags === undefined
+      ? {}
+      : { risk_flags: record.risk_flags as string[] }),
+    ...(record.suggested_cover_brief === undefined
+      ? {}
+      : { suggested_cover_brief: record.suggested_cover_brief as string | null }),
   };
 }
 
@@ -455,7 +540,7 @@ function assetReferencesFromHashes(fileHashes: Record<string, string>): {
     }
   }
   if (
-    assets.length + covers.length > MAX_INFORMATION_OS_PUBLICATION_ASSETS
+    assets.length > MAX_INFORMATION_OS_PUBLICATION_ASSETS
     || covers.length !== 1
   ) {
     fail('PACKAGE_ASSET_INVALID');
@@ -478,7 +563,11 @@ async function loadPackage(pathname: string): Promise<LoadedPackage> {
     if (entry.isSymbolicLink()) fail('PACKAGE_STRUCTURE_INVALID');
   }
 
-  const metadataBytes = await readPackageFile(root, 'metadata.json', 2 * 1024 * 1024);
+  const metadataBytes = await readPackageFile(
+    root,
+    'metadata.json',
+    MAX_INFORMATION_OS_PUBLICATION_FILE_BYTES,
+  );
   const metadata = parseMetadata(metadataBytes);
   const expectedRootHashes = [...REQUIRED_FILES];
   const actualHashReferences = Object.keys(metadata.file_hashes);
@@ -629,14 +718,12 @@ export async function prepareInformationOsPublicationPackage(
     fail('PACKAGE_STRUCTURE_INVALID');
   }
   const metadata = loaded.metadata;
-  const title = parts.options.title ?? metadata.title ?? '';
-  const author = parts.options.author ?? metadata.author ?? '';
+  const title = parts.options.title ?? metadata.title;
+  const author = parts.options.author ?? '';
   const digest = parts.options.digest ?? metadata.digest;
-  const contentSourceUrl = parts.options.contentSourceUrl ?? metadata.content_source_url ?? '';
-  const needOpenComment = parts.options.needOpenComment ?? metadata.need_open_comment ?? false;
-  const onlyFansCanComment = parts.options.onlyFansCanComment
-    ?? metadata.only_fans_can_comment
-    ?? false;
+  const contentSourceUrl = parts.options.contentSourceUrl ?? '';
+  const needOpenComment = parts.options.needOpenComment ?? false;
+  const onlyFansCanComment = parts.options.onlyFansCanComment ?? false;
   const cover = imageInput(
     loaded.coverReference,
     loaded.files.get(loaded.coverReference)!,

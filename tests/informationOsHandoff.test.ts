@@ -116,6 +116,29 @@ describe('InformationOS publication package handoff', () => {
     expect(stable.message).not.toContain(packagePath);
   });
 
+  test('enforces the exact InformationOS metadata contract', async () => {
+    const mutations: Array<(metadata: Record<string, unknown>) => void> = [
+      metadata => { delete metadata.title; },
+      metadata => { metadata.relay_token = 'must-not-cross-the-handoff-boundary'; },
+      metadata => { metadata.export_id = 'invalid id'; },
+      metadata => { metadata.created_at = '2026-02-30T00:00:00.000Z'; },
+      metadata => { metadata.fact_claims = Array.from({ length: 257 }, () => 'claim'); },
+    ];
+
+    for (const mutate of mutations) {
+      packagePath = await createPackage();
+      const metadataPath = join(packagePath, 'metadata.json');
+      const metadata = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>;
+      mutate(metadata);
+      await writeFile(metadataPath, `${JSON.stringify(metadata)}\n`, 'utf8');
+      await expect(prepareInformationOsPublicationPackage(packagePath)).rejects.toMatchObject({
+        code: 'PACKAGE_METADATA_INVALID',
+      });
+      await cleanup(packagePath);
+      packagePath = '';
+    }
+  });
+
   test('rejects traversal and extra root entries', async () => {
     packagePath = await createPackage();
     const metadata = JSON.parse(await readFile(join(packagePath, 'metadata.json'), 'utf8')) as {
@@ -149,6 +172,22 @@ describe('InformationOS publication package handoff', () => {
       code: 'PACKAGE_ASSET_INVALID',
     });
     await cleanup(packagePath);
+    const maximumAssets = Array.from({ length: MAX_INFORMATION_OS_PUBLICATION_ASSETS }, (_, index) => ({
+      reference: `assets/inline-${index}.png`,
+      bytes: new Uint8Array(onePixelPng()),
+    }));
+    packagePath = await createPackage({
+      assets: maximumAssets,
+      html: [
+        '<h1>maximum assets</h1>',
+        '<p><img src="cover/cover.png"></p>',
+        ...maximumAssets.map(asset => `<p><img src="${asset.reference}"></p>`),
+      ].join(''),
+    });
+    await expect(prepareInformationOsPublicationPackage(packagePath)).resolves.toMatchObject({
+      stats: { uniqueImageCount: MAX_INFORMATION_OS_PUBLICATION_ASSETS },
+    });
+    await cleanup(packagePath);
     const assets = Array.from({ length: MAX_INFORMATION_OS_PUBLICATION_ASSETS + 1 }, (_, index) => ({
       reference: `assets/inline-${index}.png`,
       bytes: new Uint8Array(onePixelPng()),
@@ -158,7 +197,7 @@ describe('InformationOS publication package handoff', () => {
       html: '<h1>too many</h1><p><img src="cover/cover.png"></p><p>正文</p>',
     });
     await expect(prepareInformationOsPublicationPackage(packagePath)).rejects.toMatchObject({
-      code: 'PACKAGE_ASSET_INVALID',
+      code: 'PACKAGE_METADATA_INVALID',
     });
     await cleanup(packagePath);
     packagePath = await createPackage({

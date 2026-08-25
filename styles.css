@@ -5971,7 +5971,7 @@ body.theme-dark .ailu-settings-root {
 
 .ailu-publishing-actions {
   display: grid;
-  grid-template-columns: auto auto minmax(130px, 1fr);
+  grid-template-columns: auto auto auto minmax(130px, 1fr);
   gap: 8px;
   padding: 10px 14px;
   border-top: 1px solid var(--ailu-line);
@@ -6076,6 +6076,279 @@ body.theme-dark .ailu-settings-root {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 20px;
+}
+
+.ailu-informationos-import-modal {
+  --ailu-import-accent: #397552;
+  --ailu-import-paper: color-mix(in srgb, var(--background-primary) 94%, #e7efe8 6%);
+  width: min(560px, calc(100vw - 32px));
+  max-width: 560px;
+}
+
+body.theme-dark .ailu-informationos-import-modal {
+  --ailu-import-accent: #78bd8e;
+  --ailu-import-paper: color-mix(in srgb, var(--background-primary) 90%, #31503a 10%);
+}
+
+.ailu-informationos-import-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--ailu-import-accent);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+}
+
+.ailu-informationos-import-eyebrow svg,
+.ailu-informationos-import-picker-icon svg,
+.ailu-informationos-import-seal > svg,
+.ailu-informationos-import-error svg,
+.ailu-informationos-import-warning svg {
+  width: 16px;
+  height: 16px;
+}
+
+.ailu-informationos-import-modal h2 {
+  margin: 10px 0 0;
+  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-size: 22px;
+}
+
+.ailu-informationos-import-lead {
+  margin: 10px 0 18px;
+  color: var(--text-muted);
+  line-height: 1.65;
+}
+
+.ailu-informationos-import-picker {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 5px 10px;
+  padding: 16px;
+  border: 1px dashed color-mix(in srgb, var(--ailu-import-accent) 55%, var(--background-modifier-border));
+  border-radius: 10px;
+  background: var(--ailu-import-paper);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.ailu-informationos-import-picker.is-dragging {
+  border-color: var(--ailu-import-accent);
+  background: color-mix(in srgb, var(--ailu-import-accent) 12%, var(--background-primary));
+}
+
+.ailu-informationos-import-picker-icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--ailu-import-accent);
+  color: #fff;
+}
+
+.ailu-informationos-import-picker-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ailu-informationos-import-picker-copy strong {
+  color: var(--text-normal);
+  font-size: 13px;
+}
+
+.ailu-informationos-import-picker-copy span {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.ailu-informationos-import-picker input {
+  height: 34px;
+  min-width: 0;
+  grid-column: 1 / -1;
+  margin-top: 8px;
+  border-color: color-mix(in srgb, var(--ailu-import-accent) 28%, var(--background-modifier-border));
+  background: var(--background-primary);
+  font-family: var(--font-monospace);
+  font-size: 11px;
+}
+
+.ailu-informationos-import-picker input:focus-visible {
+  border-color: var(--ailu-import-accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ailu-import-accent) 18%, transparent);
+}
+
+.ailu-informationos-import-seal {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 13px;
+  border: 1px solid color-mix(in srgb, var(--ailu-import-accent) 38%, var(--background-modifier-border));
+  border-left: 4px solid var(--ailu-import-accent);
+  background: var(--ailu-import-paper);
+}
+
+.ailu-informationos-import-seal > span:first-child {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--ailu-import-accent);
+  color: #fff;
+}
+
+.ailu-informationos-import-seal > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ailu-informationos-import-seal strong {
+  font-size: 12px;
+}
+
+.ailu-informationos-import-seal code {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ailu-informationos-import-reality {
+  color: var(--ailu-import-accent);
+  font-family: var(--font-monospace);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+}
+
+.ailu-informationos-import-article {
+  padding: 16px 2px 4px;
+}
+
+.ailu-informationos-import-article h3 {
+  margin: 0;
+  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-size: 18px;
+  line-height: 1.4;
+}
+
+.ailu-informationos-import-article > p {
+  display: -webkit-box;
+  margin: 7px 0 14px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+  -webkit-line-clamp: 2;
+}
+
+.ailu-informationos-import-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-top: 1px solid var(--background-modifier-border);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.ailu-informationos-import-facts > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 8px;
+}
+
+.ailu-informationos-import-facts > div:not(:last-child) {
+  border-right: 1px solid var(--background-modifier-border);
+}
+
+.ailu-informationos-import-facts span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.ailu-informationos-import-facts strong {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ailu-informationos-import-error,
+.ailu-informationos-import-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ailu-informationos-import-error {
+  background: color-mix(in srgb, var(--text-error) 10%, transparent);
+  color: var(--text-error);
+}
+
+.ailu-informationos-import-warning {
+  background: color-mix(in srgb, var(--text-warning) 10%, transparent);
+  color: var(--text-warning);
+}
+
+.ailu-informationos-import-error > span:first-child,
+.ailu-informationos-import-warning > span:first-child {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.ailu-informationos-import-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.ailu-informationos-import-actions button.mod-cta {
+  background: var(--ailu-import-accent);
+  color: #fff;
+}
+
+@media (max-width: 520px) {
+  .ailu-informationos-import-seal {
+    grid-template-columns: 30px minmax(0, 1fr);
+  }
+
+  .ailu-informationos-import-reality {
+    grid-column: 2;
+  }
+
+  .ailu-informationos-import-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ailu-informationos-import-facts > div:nth-child(2) {
+    border-right: 0;
+  }
+
+  .ailu-informationos-import-facts > div:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--background-modifier-border);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ailu-informationos-import-picker {
+    transition: none;
+  }
 }
 
 .ailu-settings-root {
