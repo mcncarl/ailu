@@ -94,9 +94,9 @@ requireCondition(
   'The entities runtime dependency and BSD-2-Clause lock metadata must remain pinned.',
 );
 requireCondition(
-  packageJson.overrides?.['js-yaml'] === '4.3.1'
+  packageJson.overrides?.['js-yaml'] === '4.3.2'
     && packageJson.overrides?.nanoid === '3.3.18'
-    && packageLock.packages?.['node_modules/js-yaml']?.version === '4.3.1'
+    && packageLock.packages?.['node_modules/js-yaml']?.version === '4.3.2'
     && packageLock.packages?.['node_modules/nanoid']?.version === '3.3.18',
   'Known-vulnerable js-yaml or nanoid versions must not re-enter the development dependency tree.',
 );
