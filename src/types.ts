@@ -299,6 +299,9 @@ export interface CodexModelDescriptor {
   defaultReasoningEffort: string | null;
   supportedReasoningEfforts: CodexReasoningEffortOption[];
   inputModalities: string[];
+  /** Effective catalog values when the installed App Server exposes them. */
+  contextWindowTokens?: number | null;
+  autoCompactTokenLimit?: number | null;
 }
 
 export interface CodexRuntimeStatus {
@@ -312,6 +315,9 @@ export interface CodexRuntimeStatus {
   currentModelId: string | null;
   currentModel: CodexModelDescriptor | null;
   models: CodexModelDescriptor[];
+  /** Effective config/catalog values used for Ailu's preflight context budget. */
+  contextWindowTokens?: number | null;
+  autoCompactTokenLimit?: number | null;
   imageGeneration: boolean | null;
   webSearch: boolean | null;
   error: string | null;

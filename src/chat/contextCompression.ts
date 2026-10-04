@@ -5,17 +5,37 @@ import type {
   ChatMessage,
   ChatMessageMetadata,
   ConversationContextSummary,
+  RuntimeConfigSource,
 } from '../types';
 import type { VersionedStoredConversation } from '../storage/vaultStore';
 
 export const CONTEXT_PROJECTION_VERSION = 1 as const;
 export const DEFAULT_RAW_TAIL_TURNS = 6;
+/** Legacy opt-in value; normal production planning is budget-driven. */
 export const DEFAULT_TURN_CHECKPOINT_LIMIT = 24;
 export const DEFAULT_UNKNOWN_CONTEXT_TOKENS = 32_000;
 export const DEFAULT_SOFT_CONTEXT_RATIO = 0.6;
 export const DEFAULT_HARD_CONTEXT_RATIO = 0.75;
 export const DEFAULT_SUMMARY_RESERVE_TOKENS = 3_000;
 export const DEFAULT_MAX_SUMMARY_JSON_CHARS = 20_000;
+export const DEFAULT_RAW_TAIL_TOKENS = 8_000;
+export const DEFAULT_MODEL_OUTPUT_RESERVE_TOKENS = 20_000;
+export const DEFAULT_HARD_OUTPUT_RESERVE_TOKENS = 4_000;
+/**
+ * Keep a provider-envelope guard without turning long-context models into a
+ * 1 MiB model. The smallest documented Claude transport limit is currently
+ * 20 MiB (Bedrock), so 16 MiB leaves room for the CLI/provider's JSON framing.
+ */
+export const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_REQUEST_BUFFER_BYTES = 1024 * 1024;
+export const DEFAULT_HARD_REQUEST_BUFFER_BYTES = 64 * 1024;
+export const DEFAULT_NATIVE_RUNTIME_OVERHEAD_TOKENS = 8_000;
+export const DEFAULT_ATTACHMENT_RESERVE_TOKENS = 2_000;
+export const DEFAULT_CLAUDE_CONTEXT_TOKENS = 200_000;
+export const DEFAULT_CODEX_CONTEXT_TOKENS = 272_000;
+export const DEFAULT_CLAUDE_OUTPUT_RESERVE_TOKENS = 64_000;
+export const DEFAULT_CLAUDE_LONG_OUTPUT_RESERVE_TOKENS = 128_000;
+export const DEFAULT_UNKNOWN_OUTPUT_RESERVE_TOKENS = 8_000;
 
 /**
  * Metadata, rather than an in-band delimiter, makes UI-only tool progress
@@ -111,16 +131,60 @@ export interface ContextBudgetEstimateInput {
   hardRatio?: number;
   safetyFactor?: number;
   reservedTokens?: number;
+  /** Absolute output/buffer headroom, matching OpenCode's context-minus-buffer trigger. */
+  outputReserveTokens?: number;
+  /** Emergency headroom used only to reject a request that cannot safely run at all. */
+  hardOutputReserveTokens?: number;
+  /** Independent provider-envelope guard; token estimates alone miss byte limits. */
+  maxRequestBytes?: number;
+  reservedBytes?: number;
 }
 
 export interface ContextBudgetEstimate {
   rawEstimatedTokens: number;
   estimatedTokens: number;
+  rawEstimatedBytes: number;
+  estimatedBytes: number;
   contextWindowTokens: number;
+  outputReserveTokens: number;
   softLimitTokens: number;
   hardLimitTokens: number;
+  maxRequestBytes: number;
+  softLimitBytes: number;
+  hardLimitBytes: number;
+  overSoftTokenLimit: boolean;
+  overHardTokenLimit: boolean;
+  overSoftByteLimit: boolean;
+  overHardByteLimit: boolean;
   overSoftLimit: boolean;
   overHardLimit: boolean;
+}
+
+export type ModelContextCapacitySource =
+  | 'runtime'
+  | 'declared-alias'
+  | 'known-model'
+  | 'agent-default'
+  | 'unknown';
+
+export interface ModelContextCapacityInput {
+  agentId: AgentId;
+  configSource: RuntimeConfigSource;
+  /** Exact model passed to the local CLI, including Claude's `[1m]` alias. */
+  cliModel?: string | null;
+  /** Non-secret upstream label selected by CC Switch/local Claude routing. */
+  routedModel?: string | null;
+  /** Model selected in an Ailu provider profile. */
+  providerModel?: string | null;
+  /** Effective values reported by Codex App Server when available. */
+  runtimeContextWindowTokens?: number | null;
+  runtimeAutoCompactTokenLimit?: number | null;
+}
+
+export interface ModelContextCapacity {
+  contextWindowTokens: number;
+  outputReserveTokens: number;
+  source: ModelContextCapacitySource;
 }
 
 export interface ConversationSummaryParseOptions {
@@ -172,6 +236,7 @@ export interface ContextCheckpointPlanInput extends ContextBudgetEstimateInput {
   /** One-based window messages start after this many canonical messages. */
   messageSequenceOffset?: number;
   rawTailTurns?: number;
+  rawTailTokens?: number;
   checkpointTurnLimit?: number;
 }
 
@@ -368,6 +433,39 @@ export function selectRawTail(
   };
 }
 
+/** Keep as many complete recent turns as fit a token budget; never split a turn. */
+export function selectRawTailByTokenBudget(
+  projection: CompletedConversationProjection,
+  maxTokens = DEFAULT_RAW_TAIL_TOKENS,
+): ContextTailSelection {
+  const normalizedMaxTokens = positiveInteger(maxTokens, DEFAULT_RAW_TAIL_TOKENS);
+  let boundary = projection.turns.length;
+  let selectedTokens = 0;
+  for (let index = projection.turns.length - 1; index >= 0; index -= 1) {
+    const turn = projection.turns[index];
+    const turnTokens = turn.messages.reduce(
+      (total, message) => total + estimateContextTokens(message.content) + 4,
+      0,
+    );
+    // Preserve the newest complete turn even when it alone exceeds the target;
+    // the caller may still reduce to a zero-tail summary if the request cannot fit.
+    if (boundary < projection.turns.length && selectedTokens + turnTokens > normalizedMaxTokens) {
+      break;
+    }
+    selectedTokens += turnTokens;
+    boundary = index;
+  }
+  const summarySource = projection.turns.slice(0, boundary);
+  const rawTail = projection.turns.slice(boundary);
+  const boundaryTurn = summarySource.at(-1);
+  return {
+    summarySource,
+    rawTail,
+    throughMessageSequence: boundaryTurn?.messages.at(-1)?.sequence ?? null,
+    throughMessageId: boundaryTurn?.messages.at(-1)?.id ?? null,
+  };
+}
+
 /** Conservative tokenizer-independent estimate suitable for CJK, Latin, and emoji. */
 export function estimateContextTokens(value: string): number {
   if (!value) return 0;
@@ -375,6 +473,74 @@ export function estimateContextTokens(value: string): number {
   const emojiCount = Array.from(value.matchAll(/\p{Extended_Pictographic}/gu)).length;
   const lineCount = Math.max(1, value.split('\n').length);
   return Math.max(1, Math.ceil(utf8Bytes / 3 + emojiCount * 0.75 + lineCount * 0.25));
+}
+
+/**
+ * Resolve the execution window from live runtime metadata first, then explicit
+ * CLI aliases, then conservative model-family defaults. Unknown third-party
+ * profiles remain at 32K instead of borrowing an unrelated vendor's limit.
+ */
+export function resolveModelContextCapacity(
+  input: ModelContextCapacityInput,
+): ModelContextCapacity {
+  const runtimeWindow = optionalPositiveInteger(input.runtimeContextWindowTokens);
+  if (runtimeWindow) {
+    return {
+      contextWindowTokens: runtimeWindow,
+      outputReserveTokens: resolveOutputReserve(
+        runtimeWindow,
+        input.runtimeAutoCompactTokenLimit,
+      ),
+      source: 'runtime',
+    };
+  }
+
+  if (input.agentId === 'codex') {
+    const model = firstText(input.cliModel, input.routedModel, input.providerModel).toLowerCase();
+    if (!model || /^(?:gpt-5(?:[.\w-]*)?|codex(?:[.\w-]*)?)$/iu.test(model)) {
+      return capacity(DEFAULT_CODEX_CONTEXT_TOKENS, 'agent-default');
+    }
+    return capacity(DEFAULT_UNKNOWN_CONTEXT_TOKENS, 'unknown');
+  }
+
+  const declaredWindow = parseDeclaredContextWindow(input.cliModel);
+  if (declaredWindow) {
+    return capacity(
+      declaredWindow,
+      'declared-alias',
+      claudeOutputReserve(declaredWindow),
+    );
+  }
+
+  const models = [input.routedModel, input.providerModel, input.cliModel]
+    .map(value => value?.trim().toLowerCase() ?? '')
+    .filter(Boolean);
+  if (models.some(isKnownMillionTokenClaudeModel)) {
+    return capacity(
+      1_000_000,
+      'known-model',
+      DEFAULT_CLAUDE_LONG_OUTPUT_RESERVE_TOKENS,
+    );
+  }
+  if (models.some(value => /^(?:claude-)?(?:haiku|sonnet|opus)(?:(?:-|\[).*)?$/iu.test(value))) {
+    return capacity(
+      DEFAULT_CLAUDE_CONTEXT_TOKENS,
+      'known-model',
+      DEFAULT_CLAUDE_OUTPUT_RESERVE_TOKENS,
+    );
+  }
+  if (input.configSource === 'localCli' && models.length === 0) {
+    return capacity(
+      DEFAULT_CLAUDE_CONTEXT_TOKENS,
+      'agent-default',
+      DEFAULT_CLAUDE_OUTPUT_RESERVE_TOKENS,
+    );
+  }
+  return capacity(
+    DEFAULT_UNKNOWN_CONTEXT_TOKENS,
+    'unknown',
+    DEFAULT_UNKNOWN_OUTPUT_RESERVE_TOKENS,
+  );
 }
 
 export function estimateContextBudget(input: ContextBudgetEstimateInput): ContextBudgetEstimate {
@@ -395,17 +561,63 @@ export function estimateContextBudget(input: ContextBudgetEstimateInput): Contex
     (total, value) => total + estimateContextTokens(value),
     0,
   );
+  const rawEstimatedBytes = textParts.reduce(
+    (total, value) => total + new TextEncoder().encode(value).length,
+    0,
+  );
   const estimatedTokens = Math.ceil(rawEstimatedTokens * safetyFactor) + reservedTokens;
-  const softLimitTokens = Math.max(1, Math.floor(contextWindowTokens * Math.min(softRatio, hardRatio)));
-  const hardLimitTokens = Math.max(softLimitTokens, Math.floor(contextWindowTokens * Math.max(softRatio, hardRatio)));
+  const estimatedBytes = Math.ceil(rawEstimatedBytes * safetyFactor)
+    + nonNegativeInteger(input.reservedBytes, 0);
+  const usesAbsoluteOutputReserve = input.outputReserveTokens !== undefined;
+  const outputReserveTokens = usesAbsoluteOutputReserve
+    ? Math.min(
+      contextWindowTokens - 1,
+      positiveInteger(input.outputReserveTokens, DEFAULT_MODEL_OUTPUT_RESERVE_TOKENS),
+    )
+    : 0;
+  const hardOutputReserveTokens = usesAbsoluteOutputReserve
+    ? Math.min(
+      outputReserveTokens,
+      positiveInteger(input.hardOutputReserveTokens, DEFAULT_HARD_OUTPUT_RESERVE_TOKENS),
+    )
+    : 0;
+  const softLimitTokens = usesAbsoluteOutputReserve
+    ? Math.max(1, contextWindowTokens - outputReserveTokens)
+    : Math.max(1, Math.floor(contextWindowTokens * Math.min(softRatio, hardRatio)));
+  const hardLimitTokens = usesAbsoluteOutputReserve
+    ? Math.max(softLimitTokens, contextWindowTokens - hardOutputReserveTokens)
+    : Math.max(softLimitTokens, Math.floor(contextWindowTokens * Math.max(softRatio, hardRatio)));
+  const maxRequestBytes = positiveInteger(input.maxRequestBytes, DEFAULT_MAX_REQUEST_BYTES);
+  const softLimitBytes = Math.max(1, maxRequestBytes - Math.min(
+    maxRequestBytes - 1,
+    DEFAULT_REQUEST_BUFFER_BYTES,
+  ));
+  const hardLimitBytes = Math.max(softLimitBytes, maxRequestBytes - Math.min(
+    maxRequestBytes - 1,
+    DEFAULT_HARD_REQUEST_BUFFER_BYTES,
+  ));
+  const overSoftTokenLimit = estimatedTokens >= softLimitTokens;
+  const overHardTokenLimit = estimatedTokens >= hardLimitTokens;
+  const overSoftByteLimit = estimatedBytes >= softLimitBytes;
+  const overHardByteLimit = estimatedBytes >= hardLimitBytes;
   return {
     rawEstimatedTokens,
     estimatedTokens,
+    rawEstimatedBytes,
+    estimatedBytes,
     contextWindowTokens,
+    outputReserveTokens,
     softLimitTokens,
     hardLimitTokens,
-    overSoftLimit: estimatedTokens >= softLimitTokens,
-    overHardLimit: estimatedTokens >= hardLimitTokens,
+    maxRequestBytes,
+    softLimitBytes,
+    hardLimitBytes,
+    overSoftTokenLimit,
+    overHardTokenLimit,
+    overSoftByteLimit,
+    overHardByteLimit,
+    overSoftLimit: overSoftTokenLimit || overSoftByteLimit,
+    overHardLimit: overHardTokenLimit || overHardByteLimit,
   };
 }
 
@@ -642,7 +854,10 @@ export function planContextCheckpoint(input: ContextCheckpointPlanInput): Contex
   const previousSummary = storedPreviousSummary
     ? sanitizeConversationContextSummary(storedPreviousSummary)
     : undefined;
-  const selection = selectRawTail(projection, input.rawTailTurns ?? DEFAULT_RAW_TAIL_TURNS);
+  const selection = input.rawTailTurns === undefined
+    ? selectRawTailByTokenBudget(projection, input.rawTailTokens ?? DEFAULT_RAW_TAIL_TOKENS)
+    : selectRawTail(projection, input.rawTailTurns);
+  const outputReserveTokens = input.outputReserveTokens ?? DEFAULT_MODEL_OUTPUT_RESERVE_TOKENS;
   const budget = estimateContextBudget({
     projection,
     previousSummary,
@@ -652,6 +867,10 @@ export function planContextCheckpoint(input: ContextCheckpointPlanInput): Contex
     hardRatio: input.hardRatio,
     safetyFactor: input.safetyFactor,
     reservedTokens: input.reservedTokens,
+    outputReserveTokens,
+    hardOutputReserveTokens: input.hardOutputReserveTokens,
+    maxRequestBytes: input.maxRequestBytes,
+    reservedBytes: input.reservedBytes,
   });
   const compactedProjection: CompletedConversationProjection = {
     ...projection,
@@ -665,23 +884,29 @@ export function planContextCheckpoint(input: ContextCheckpointPlanInput): Contex
     hardRatio: input.hardRatio,
     safetyFactor: input.safetyFactor,
     reservedTokens: (input.reservedTokens ?? 0) + DEFAULT_SUMMARY_RESERVE_TOKENS,
+    outputReserveTokens,
+    hardOutputReserveTokens: input.hardOutputReserveTokens,
+    maxRequestBytes: input.maxRequestBytes,
+    reservedBytes: input.reservedBytes,
   });
   const sessionFreshness = evaluateTargetSessionFreshness(input.conversation, input.targetAgentId);
   const latestTurn = projection.turns.at(-1);
   const agentSwitch = Boolean(latestTurn && latestTurn.agentId !== input.targetAgentId);
-  const checkpointTurnLimit = positiveInteger(
-    input.checkpointTurnLimit,
-    DEFAULT_TURN_CHECKPOINT_LIMIT,
-  );
+  const checkpointTurnLimit = input.checkpointTurnLimit === undefined
+    ? null
+    : positiveInteger(input.checkpointTurnLimit, DEFAULT_TURN_CHECKPOINT_LIMIT);
   const reasons: ContextCheckpointTriggerReason[] = [];
   if (agentSwitch) reasons.push('agent-switch');
   if (sessionFreshness.stale) reasons.push('session-stale');
   if (budget.overHardLimit) reasons.push('hard-budget');
   else if (budget.overSoftLimit) reasons.push('soft-budget');
-  if (projection.turns.length >= checkpointTurnLimit) reasons.push('turn-limit');
+  if (checkpointTurnLimit !== null && projection.turns.length >= checkpointTurnLimit) {
+    reasons.push('turn-limit');
+  }
 
   const needsBridge = agentSwitch || sessionFreshness.stale;
-  const budgetOrTurnTrigger = budget.overSoftLimit || projection.turns.length >= checkpointTurnLimit;
+  const budgetOrTurnTrigger = budget.overSoftLimit
+    || (checkpointTurnLimit !== null && projection.turns.length >= checkpointTurnLimit);
   const canSummarizePrefix = selection.summarySource.length > 0;
   let action: ContextCheckpointAction = 'none';
   if (projection.turns.length > 0 && compactedBudget.overHardLimit && (budget.overHardLimit || needsBridge)) {
@@ -790,6 +1015,65 @@ function sha256Text(value: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function capacity(
+  contextWindowTokens: number,
+  source: ModelContextCapacitySource,
+  outputReserveTokens = DEFAULT_MODEL_OUTPUT_RESERVE_TOKENS,
+): ModelContextCapacity {
+  return {
+    contextWindowTokens,
+    outputReserveTokens: Math.min(contextWindowTokens - 1, outputReserveTokens),
+    source,
+  };
+}
+
+function claudeOutputReserve(contextWindowTokens: number): number {
+  if (contextWindowTokens >= 1_000_000) return DEFAULT_CLAUDE_LONG_OUTPUT_RESERVE_TOKENS;
+  if (contextWindowTokens >= DEFAULT_CLAUDE_CONTEXT_TOKENS) {
+    return DEFAULT_CLAUDE_OUTPUT_RESERVE_TOKENS;
+  }
+  return Math.min(
+    DEFAULT_UNKNOWN_OUTPUT_RESERVE_TOKENS,
+    Math.max(1, Math.floor(contextWindowTokens / 4)),
+  );
+}
+
+function resolveOutputReserve(
+  contextWindowTokens: number,
+  autoCompactTokenLimit?: number | null,
+): number {
+  const runtimeLimit = optionalPositiveInteger(autoCompactTokenLimit);
+  if (runtimeLimit && runtimeLimit < contextWindowTokens) {
+    return Math.max(1, contextWindowTokens - runtimeLimit);
+  }
+  return Math.min(contextWindowTokens - 1, DEFAULT_MODEL_OUTPUT_RESERVE_TOKENS);
+}
+
+function parseDeclaredContextWindow(value: string | null | undefined): number | null {
+  const match = value?.trim().match(/\[(\d+)([km])\]$/iu);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const multiplier = match[2]?.toLowerCase() === 'm' ? 1_000_000 : 1_000;
+  const tokens = amount * multiplier;
+  return Number.isSafeInteger(tokens) && tokens >= DEFAULT_UNKNOWN_CONTEXT_TOKENS
+    ? tokens
+    : null;
+}
+
+function isKnownMillionTokenClaudeModel(value: string): boolean {
+  return /^(?:claude-)?(?:fable|mythos|sonnet|opus)-5(?:[-.]|$)/iu.test(value)
+    || /^(?:claude-)?opus-4-(?:6|7|8)(?:[-.]|$)/iu.test(value)
+    || /^(?:claude-)?sonnet-4-6(?:[-.]|$)/iu.test(value);
+}
+
+function firstText(...values: Array<string | null | undefined>): string {
+  return values.find(value => value?.trim())?.trim() ?? '';
+}
+
+function optionalPositiveInteger(value: number | null | undefined): number | null {
+  return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : null;
 }
 
 function nonNegativeInteger(value: number | undefined, fallback: number): number {

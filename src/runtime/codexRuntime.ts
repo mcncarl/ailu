@@ -71,6 +71,8 @@ const EMPTY_STATUS: CodexRuntimeStatus = {
   currentModelId: null,
   currentModel: null,
   models: [],
+  contextWindowTokens: null,
+  autoCompactTokenLimit: null,
   imageGeneration: null,
   webSearch: null,
   error: null,
@@ -784,6 +786,18 @@ export class CodexAppServerRuntime extends EventEmitter {
         ?? models.find(model => model.isDefault)?.id
         ?? null;
       const currentModel = models.find(model => model.id === currentModelId || model.model === currentModelId) ?? null;
+      const contextWindowTokens = positiveIntegerAt(config, 'config', 'model_context_window')
+        ?? positiveIntegerAt(config, 'config', 'modelContextWindow')
+        ?? currentModel?.contextWindowTokens
+        ?? null;
+      const autoCompactTokenLimit = positiveIntegerAt(
+        config,
+        'config',
+        'model_auto_compact_token_limit',
+      )
+        ?? positiveIntegerAt(config, 'config', 'modelAutoCompactTokenLimit')
+        ?? currentModel?.autoCompactTokenLimit
+        ?? null;
       const accountValue = recordAt(account, 'account');
       const authMode = stringAt(account, 'authMode')
         ?? stringAt(accountValue, 'type')
@@ -801,6 +815,8 @@ export class CodexAppServerRuntime extends EventEmitter {
         currentModelId,
         currentModel,
         models,
+        contextWindowTokens,
+        autoCompactTokenLimit,
         imageGeneration: readCapability(capabilities, 'imageGeneration'),
         webSearch: readCapability(capabilities, 'webSearch'),
         error: null,
@@ -1518,6 +1534,12 @@ function toModelDescriptor(value: unknown): CodexModelDescriptor | null {
     defaultReasoningEffort: stringAt(value, 'defaultReasoningEffort'),
     supportedReasoningEfforts,
     inputModalities: modalities,
+    contextWindowTokens: positiveIntegerAt(value, 'contextWindow')
+      ?? positiveIntegerAt(value, 'context_window')
+      ?? positiveIntegerAt(value, 'modelContextWindow'),
+    autoCompactTokenLimit: positiveIntegerAt(value, 'autoCompactTokenLimit')
+      ?? positiveIntegerAt(value, 'auto_compact_token_limit')
+      ?? positiveIntegerAt(value, 'modelAutoCompactTokenLimit'),
   };
 }
 
@@ -1549,6 +1571,11 @@ function stringAt(value: unknown, ...path: string[]): string | null {
 function numberAt(value: unknown, ...path: string[]): number | null {
   const resolved = valueAt(value, ...path);
   return typeof resolved === 'number' ? resolved : null;
+}
+
+function positiveIntegerAt(value: unknown, ...path: string[]): number | null {
+  const resolved = numberAt(value, ...path);
+  return Number.isSafeInteger(resolved) && Number(resolved) > 0 ? Number(resolved) : null;
 }
 
 function valueAt(value: unknown, ...path: string[]): unknown {

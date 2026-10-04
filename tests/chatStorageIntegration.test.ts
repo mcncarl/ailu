@@ -1,6 +1,7 @@
 import type { DataAdapter } from 'obsidian';
 
 import {
+  ChatContextOverflowError,
   ChatContextService,
   ChatRunCoordinator,
   type ChatRunCoordinatorDependencies,
@@ -15,6 +16,10 @@ import type {
   ChatTurnRequest,
   RuntimeTurnEvent,
 } from '../src/types';
+import {
+  buildClaudeSessionConfigKey,
+  shouldResumeClaudeSession,
+} from '../src/ui/chatAgentSelection';
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -387,12 +392,32 @@ describe('chat coordinator with the v2 VaultStore', () => {
       state: 'active',
     });
     await waitForPrompts(runtime, [context.effectivePrompt]);
-    runtime.finish(context.effectivePrompt, { type: 'text', content: 'Codex continued safely.' }, { type: 'done' });
+    runtime.finish(
+      context.effectivePrompt,
+      { type: 'session', sessionId: 'codex-atomic-session' },
+      { type: 'text', content: 'Codex continued safely.' },
+      { type: 'done' },
+    );
     await expect(handle.completion).resolves.toMatchObject({ status: 'completed', finalPersisted: true });
 
     expect(persistenceFailures).toEqual([]);
     expect(() => coordinator.assertContextPreparationAllowed(before.id)).not.toThrow();
+    const followupContext = await new ChatContextService({ store }).prepare({
+      conversationId: before.id,
+      targetAgentId: 'codex',
+      currentPrompt: 'codex-followup-turn',
+      resumeCandidate: 'codex-atomic-session',
+      modelContextTokens: 1_000_000,
+      modelOutputReserveTokens: 20_000,
+      reservedInputTokens: 8_000,
+    });
+    expect(followupContext.mode).toBe('native-resume');
+    expect(followupContext.contextCheckpointDraft).toBeUndefined();
+    expect(followupContext.notice).toBe('');
     const followup = submission(before.id, 'codex-followup-turn');
+    followup.expectedRevision = followupContext.sourceRevision;
+    followup.runtimeRequest.prompt = followupContext.effectivePrompt;
+    followup.runtimeRequest.sessionId = followupContext.sessionId;
     const followupHandle = await coordinator.submit(followup);
     await waitForPrompts(runtime, [followup.runtimeRequest.prompt]);
     runtime.finish(
@@ -466,6 +491,203 @@ describe('chat coordinator with the v2 VaultStore', () => {
     const after = await store.getConversation('revision-bound-handoff');
     expect(after?.turns.some(turn => turn.id === 'stale-short-handoff')).toBe(false);
     expect(after?.messages.some(message => message.id === 'stale-short-handoff-user')).toBe(false);
+    await coordinator.shutdown();
+    await store.releaseWriteLease();
+  });
+
+  test('switches a model session and then continues consecutive turns without repeated checkpoints', async () => {
+    const adapter = new IntegrationDataAdapter();
+    const store = new VaultStore(adapter as unknown as DataAdapter, {
+      instanceId: 'model-switch-continuity-integration',
+      requireWriteLease: true,
+    });
+    expect((await store.acquireWriteLease({ startHeartbeat: false })).mode).toBe('writer');
+    await store.ensureV2Store({ quiescenceBarrier: async () => ({ activeRuns: 0 }) });
+    const runtime = new HoldRuntime();
+    const persistenceFailures: Array<{ stage: string; failureKind: string }> = [];
+    const dependencies = coordinatorDependencies(store, runtime);
+    dependencies.onPersistenceFailure = failure => persistenceFailures.push(failure);
+    const coordinator = new ChatRunCoordinator(dependencies);
+
+    const modelAConfigKey = buildClaudeSessionConfigKey({
+      configSource: 'localCli',
+      effectiveModel: 'model-a',
+    });
+    const first = submission('model-switch-continuity', 'model-a-turn');
+    first.runtimeRequest.agentId = 'claude';
+    first.runtimeRequest.model = 'model-a';
+    first.userMessage.agentId = 'claude';
+    first.assistantMessage.agentId = 'claude';
+    first.sessionConfigKey = modelAConfigKey;
+    const firstHandle = await coordinator.submit(first);
+    await waitForPrompts(runtime, ['model-a-turn']);
+    runtime.finish(
+      'model-a-turn',
+      { type: 'session', sessionId: 'model-a-session' },
+      { type: 'text', content: 'First model completed.' },
+      { type: 'done' },
+    );
+    await expect(firstHandle.completion).resolves.toMatchObject({
+      status: 'completed',
+      finalPersisted: true,
+    });
+
+    const afterFirst = await store.getConversation('model-switch-continuity');
+    expect(afterFirst?.sessionIds?.claude).toBe('model-a-session');
+    expect(afterFirst?.sessionConfigKeys?.claude).toBe(modelAConfigKey);
+    const modelBConfigKey = buildClaudeSessionConfigKey({
+      configSource: 'localCli',
+      effectiveModel: 'model-b',
+    });
+    const storedModelASession = afterFirst?.sessionIds?.claude;
+    const switchedResumeCandidate = shouldResumeClaudeSession(
+      storedModelASession,
+      afterFirst?.sessionConfigKeys?.claude,
+      modelBConfigKey,
+    ) ? storedModelASession : undefined;
+    expect(switchedResumeCandidate).toBeUndefined();
+
+    const contextService = new ChatContextService({ store });
+    const switched = await contextService.prepare({
+      conversationId: 'model-switch-continuity',
+      targetAgentId: 'claude',
+      currentPrompt: 'model-b-turn',
+      resumeCandidate: switchedResumeCandidate,
+      modelContextTokens: 1_000_000,
+      modelOutputReserveTokens: 128_000,
+      reservedInputTokens: 8_000,
+    });
+    expect(switched.mode).toBe('fresh-handoff');
+    expect(switched.contextCheckpointDraft).toBeUndefined();
+    expect(switched.notice).toBe('');
+
+    const second = submission('model-switch-continuity', 'model-b-turn');
+    second.runtimeRequest.agentId = 'claude';
+    second.runtimeRequest.model = 'model-b';
+    second.runtimeRequest.prompt = switched.effectivePrompt;
+    second.userMessage.agentId = 'claude';
+    second.assistantMessage.agentId = 'claude';
+    second.sessionConfigKey = modelBConfigKey;
+    second.expectedRevision = switched.sourceRevision;
+    const secondHandle = await coordinator.submit(second);
+    await waitForPrompts(runtime, [switched.effectivePrompt]);
+    runtime.finish(
+      switched.effectivePrompt,
+      { type: 'session', sessionId: 'model-b-session' },
+      { type: 'text', content: 'Second model completed.' },
+      { type: 'done' },
+    );
+    await expect(secondHandle.completion).resolves.toMatchObject({
+      status: 'completed',
+      finalPersisted: true,
+    });
+
+    const afterSecond = await store.getConversation('model-switch-continuity');
+    const storedModelBSession = afterSecond?.sessionIds?.claude;
+    const consecutiveResumeCandidate = shouldResumeClaudeSession(
+      storedModelBSession,
+      afterSecond?.sessionConfigKeys?.claude,
+      modelBConfigKey,
+    ) ? storedModelBSession : undefined;
+    expect(consecutiveResumeCandidate).toBe('model-b-session');
+    const consecutive = await contextService.prepare({
+      conversationId: 'model-switch-continuity',
+      targetAgentId: 'claude',
+      currentPrompt: 'model-b-followup',
+      resumeCandidate: consecutiveResumeCandidate,
+      modelContextTokens: 1_000_000,
+      modelOutputReserveTokens: 128_000,
+      reservedInputTokens: 8_000,
+    });
+    expect(consecutive.mode).toBe('native-resume');
+    expect(consecutive.sessionId).toBe('model-b-session');
+    expect(consecutive.contextCheckpointDraft).toBeUndefined();
+
+    const third = submission('model-switch-continuity', 'model-b-followup');
+    third.runtimeRequest.agentId = 'claude';
+    third.runtimeRequest.model = 'model-b';
+    third.runtimeRequest.prompt = consecutive.effectivePrompt;
+    third.runtimeRequest.sessionId = consecutive.sessionId;
+    third.userMessage.agentId = 'claude';
+    third.assistantMessage.agentId = 'claude';
+    third.sessionConfigKey = modelBConfigKey;
+    third.expectedRevision = consecutive.sourceRevision;
+    const thirdHandle = await coordinator.submit(third);
+    await waitForPrompts(runtime, ['model-b-followup']);
+    runtime.finish(
+      'model-b-followup',
+      { type: 'text', content: 'Consecutive turn completed.' },
+      { type: 'done' },
+    );
+    await expect(thirdHandle.completion).resolves.toMatchObject({
+      status: 'completed',
+      finalPersisted: true,
+    });
+
+    const stored = await store.getConversation('model-switch-continuity');
+    expect(stored?.turns.map(turn => turn.state)).toEqual([
+      'completed',
+      'completed',
+      'completed',
+    ]);
+    expect(stored?.contextCheckpoint).toBeUndefined();
+    expect(stored?.sessionConfigKeys?.claude).toBe(modelBConfigKey);
+    expect(persistenceFailures).toEqual([]);
+    await coordinator.shutdown();
+    await store.releaseWriteLease();
+  });
+
+  test('blocks a no-progress overflow before runtime start or durable turn creation', async () => {
+    const adapter = new IntegrationDataAdapter();
+    const store = new VaultStore(adapter as unknown as DataAdapter, {
+      instanceId: 'context-overflow-preflight-integration',
+      requireWriteLease: true,
+    });
+    expect((await store.acquireWriteLease({ startHeartbeat: false })).mode).toBe('writer');
+    await store.ensureV2Store({ quiescenceBarrier: async () => ({ activeRuns: 0 }) });
+    const runtime = new HoldRuntime();
+    const coordinator = new ChatRunCoordinator(coordinatorDependencies(store, runtime));
+
+    const seed = submission('context-overflow-preflight', 'seed-turn');
+    const seedHandle = await coordinator.submit(seed);
+    await waitForPrompts(runtime, ['seed-turn']);
+    runtime.finish(
+      'seed-turn',
+      { type: 'session', sessionId: 'overflow-preflight-session' },
+      { type: 'text', content: 'Seed completed.' },
+      { type: 'done' },
+    );
+    await expect(seedHandle.completion).resolves.toMatchObject({
+      status: 'completed',
+      finalPersisted: true,
+    });
+    const before = await store.getConversation('context-overflow-preflight');
+
+    const prepareThenSubmit = async () => {
+      const prepared = await new ChatContextService({ store }).prepare({
+        conversationId: 'context-overflow-preflight',
+        targetAgentId: 'claude',
+        currentPrompt: 'a'.repeat(800_000),
+        resumeCandidate: 'overflow-preflight-session',
+        modelContextTokens: 1_000_000,
+        modelOutputReserveTokens: 128_000,
+        maxRequestBytes: 1024 * 1024,
+      });
+      const next = submission('context-overflow-preflight', 'must-not-start');
+      next.expectedRevision = prepared.sourceRevision;
+      next.runtimeRequest.prompt = prepared.effectivePrompt;
+      next.runtimeRequest.sessionId = prepared.sessionId;
+      return coordinator.submit(next);
+    };
+
+    await expect(prepareThenSubmit()).rejects.toBeInstanceOf(ChatContextOverflowError);
+    expect(runtime.invocations.map(invocation => invocation.prompt)).toEqual(['seed-turn']);
+    const after = await store.getConversation('context-overflow-preflight');
+    expect(after?.revision).toBe(before?.revision);
+    expect(after?.turns).toHaveLength(1);
+    expect(after?.turns[0]?.state).toBe('completed');
+    expect(after?.contextCheckpoint).toBeUndefined();
+
     await coordinator.shutdown();
     await store.releaseWriteLease();
   });
